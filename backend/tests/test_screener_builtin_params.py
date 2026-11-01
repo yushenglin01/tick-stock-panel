@@ -59,7 +59,7 @@ class _CapturingStrategyEngine:
         })
         return ScreenerResult(as_of=context.as_of, strategy=strategy_id)
 
-    def run_all(self, context, *, params_map=None, overrides_map=None, strategy_ids=None):
+    def run_all(self, context, *, params_map=None, overrides_map=None, strategy_ids=None, parallel=True):
         self.calls.append({
             "kind": "run_all",
             "params_map": params_map,
@@ -82,7 +82,7 @@ def _install_api_fakes(monkeypatch):
     _CapturingScreenerService.calls = []
     _CapturingStrategyEngine.calls = []
     monkeypatch.setattr(screener_api, "ScreenerService", _CapturingScreenerService)
-    monkeypatch.setattr(screener_api, "_load_ext_value_maps", lambda *_args: {})
+    monkeypatch.setattr(screener_api, "_load_ext_value_maps", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(screener_api, "_update_cache_strategy", lambda *_args: None)
     monkeypatch.setattr(screener_api.strategy_cache, "write_cache", lambda *_args: None)
 
@@ -153,8 +153,13 @@ def test_batch_summary_response_still_writes_full_cache(monkeypatch, tmp_path):
         },
     )
 
-    assert payload == {
-        "as_of": "2026-07-15",
-        "results": {"builtin_strategy": {"total": 0, "as_of": "2026-07-15"}},
-    }
+    assert payload["as_of"] == "2026-07-15"
+    assert payload["results"]["builtin_strategy"]["total"] == 0
+    assert payload["results"]["builtin_strategy"]["as_of"] == "2026-07-15"
+    # 渐进式路径: 全部算完 → complete 且无 pending
+    assert payload["pending"] == []
+    assert payload["complete"] is True
+    assert payload["error"] is None
+    # 渐进式增量写 + 收尾全量写都带 rows, 缓存口径不变
     assert written[0][2]["builtin_strategy"]["rows"] == []
+    assert written[-1][2]["builtin_strategy"]["rows"] == []

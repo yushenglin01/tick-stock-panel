@@ -5,6 +5,7 @@ import { fmtPrice, fmtBigNum, fmtVolume } from '@/lib/format'
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { INFO_GROUPS, type ColumnConfig } from '@/lib/stock-info-fields'
+import { storage } from '@/lib/storage'
 import { buildStockExternalUrl, loadStockExternalTemplate } from '@/lib/stock-external-link'
 
 const BULL = '#C74040'
@@ -27,6 +28,8 @@ interface Props {
   onAddToWatchlist?: (groupId: string | null) => void
   onRemoveFromWatchlist?: () => void
   watchlistPending?: boolean
+  /** 加入自选日 (北京时间 YYYY-MM-DD); 有值时在自定义信息条按钮左侧显示「自选于」标注 */
+  addedDate?: string | null
 }
 
 /**
@@ -108,6 +111,7 @@ export function StockInfoBar({
   onAddToWatchlist,
   onRemoveFromWatchlist,
   watchlistPending,
+  addedDate,
 }: Props) {
   // 弹窗开关：纯本地状态，与数据/配置无关，放早期 return 之前
   const [customizerOpen, setCustomizerOpen] = useState(false)
@@ -296,6 +300,16 @@ export function StockInfoBar({
               <RadioTower className="h-3.5 w-3.5" />
             </button>
           )}
+          {/* 加入自选日标注 (常显): 弹窗不知道区间内哪天是交易日, 常显既避免错误的
+              区间判断, 也覆盖「区间外」与「周末加入」两种情况 */}
+          {addedDate && (
+            <span
+              className="shrink-0 font-mono text-[10px] text-muted"
+              title="加入自选日 (北京时间); 该日无K线时不画竖线"
+            >
+              自选于 {addedDate}
+            </span>
+          )}
           <button
             onClick={() => setCustomizerOpen(true)}
             className="p-1 rounded-btn text-muted hover:text-foreground hover:bg-elevated transition-colors"
@@ -335,6 +349,10 @@ export function StockInfoBar({
         extColumnAlign="left"
         showStandaloneToggle
         disableBackdropBlur
+        baselineStore={{
+          get: () => storage.stockInfoBarFieldsBaseline.get(null) as ColumnConfig[] | null,
+          set: cols => storage.stockInfoBarFieldsBaseline.set(cols),
+        }}
       />
     </div>
   )

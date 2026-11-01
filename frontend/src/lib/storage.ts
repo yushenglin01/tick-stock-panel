@@ -23,6 +23,20 @@ function kv<T>(key: string) {
   }
 }
 
+/** 新建策略默认基础过滤参数 (与策略 META.basic_filter 字段/单位一致: 价格元, 市值/成交额元, 换手%) */
+export interface DefaultStrategyBasicFilter {
+  price_min: number | null
+  price_max: number | null
+  float_cap_min: number | null
+  float_cap_max: number | null
+  amount_min: number | null
+  amount_max: number | null
+  turnover_min: number | null
+  turnover_max: number | null
+  exclude_st: boolean
+  boards: string[]
+}
+
 export const storage = {
   /** 查询轮询 / SSE 配置 */
   queryConfig:          kv<unknown>('tf-stocks-query-config'),
@@ -34,9 +48,13 @@ export const storage = {
 
   /** 自选列表列配置 */
   watchlistColumns:     kv<unknown[]>('watchlist_columns'),
+  /** 自选列表「默认方案」快照 — 恢复默认时回到这份, 而非内置默认 */
+  watchlistColumnsBaseline: kv<unknown[] | null>('watchlist_columns_baseline'),
 
   /** 个股日K信息条指标配置 */
   stockInfoBarFields:   kv<unknown[]>('stock_info_bar_fields'),
+  /** 信息条指标「默认方案」快照 */
+  stockInfoBarFieldsBaseline: kv<unknown[] | null>('stock_info_bar_fields_baseline'),
 
   /** 个股日K成交量对比设置 */
   stockVolumeCompare:   kv<{ enabled: boolean; days: number }>('stock_volume_compare'),
@@ -49,6 +67,8 @@ export const storage = {
 
   /** 策略结果列表列配置 */
   screenerResultColumns: kv<unknown[]>('screener_result_columns'),
+  /** 策略结果列表「默认方案」快照 */
+  screenerResultColumnsBaseline: kv<unknown[] | null>('screener_result_columns_baseline'),
 
   /** 自选列表视图模式 table | card (分组卡片为临时模式, 不持久化) */
   watchlistView:        kv<string>('watchlist_view'),
@@ -64,6 +84,12 @@ export const storage = {
 
   /** 策略结果列表分时图显示状态 */
   screenerIntraday:     kv<boolean>('screener_showIntraday'),
+
+  /** 自选列表分时纵轴模式: adaptive | limit */
+  watchlistIntradayYMode: kv<string>('watchlist_intradayYMode'),
+
+  /** 策略结果列表分时纵轴模式: adaptive | limit */
+  screenerIntradayYMode:  kv<string>('screener_intradayYMode'),
 
   /** 策略结果列表"策略"列标签展开状态 (false=默认收起: 每行首个+计数, 行内可单独展开) */
   screenerStrategyTags: kv<boolean>('screener_strategyTagsExpanded'),
@@ -86,6 +112,9 @@ export const storage = {
   /** Screener 卡片尺寸 */
   screenerCardSize:     kv<string>('screener-card-size'),
 
+  /** 界面整体缩放 (0.8–1.5, 设置→系统→界面缩放; 桌面客户端无浏览器缩放快捷键) */
+  pageZoom:             kv<number>('tf-page-zoom'),
+
   /** 连板梯队板块筛选 */
   limitLadderBoard:     kv<string[]>('limit-ladder-board-filter'),
 
@@ -103,6 +132,9 @@ export const storage = {
 
   /** 策略创建草稿（新建专用） */
   strategyDraft: kv<{ name: string; description: string; direction: string; style?: string; rules: string; code: string; step: number; strategyId: string; source?: 'ai' | 'custom' } | null>('strategy-draft'),
+
+  /** 新建策略默认基础过滤参数 (策略页「默认基础参数」设置; null=未自定义, 用内置默认) */
+  defaultStrategyBasicFilter: kv<DefaultStrategyBasicFilter | null>('default-strategy-basic-filter'),
 
   /** 策略修改草稿（AI修改专用，不影响创建按钮） */
   strategyModify: kv<{ name: string; description: string; direction: string; style?: string; rules: string; code: string; step: number; strategyId: string; source?: 'ai' | 'custom' } | null>('strategy-modify'),
@@ -132,7 +164,9 @@ export const storage = {
     maxPositions: string
     maxExposure: string
     initialCapital: string
-    positionSizing: 'equal' | 'score_weight'
+    positionSizing: 'equal' | 'score_weight' | 'policy'
+    positionPolicyId?: string
+    positionPolicyParams?: Record<string, number | boolean | string>
     mode: 'position' | 'full'
     holdingDays: string
     minuteFill?: boolean

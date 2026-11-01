@@ -16,6 +16,7 @@ import polars as pl
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from app.market_time import CN_TZ, cn_today
 from app.services.ext_data import (
     ExtConfig,
     ExtConfigStore,
@@ -24,13 +25,15 @@ from app.services.ext_data import (
     apply_config_mapping,
     detect_symbol_candidates,
     ensure_utf8_csv,
+    ext_api_key_field,
     fix_symbol_format,
+    get_ext_api_key,
     infer_fields_from_df,
     parse_upload_file,
-    write_ext_parquet,
     rows_to_parquet,
+    write_ext_parquet,
 )
-from app.services.ext_pull import fetch_and_ingest, pull_scheduler
+from app.services.ext_pull import _request_json, fetch_and_ingest, pull_scheduler
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/ext-data", tags=["ext-data"])
@@ -54,6 +57,7 @@ class CreateExtReq(BaseModel):
     description: str = ""
     symbol_map: dict = {}   # {"type": "mapped", "col": "..."} 或 {"type": "computed", "from": "code", "method": "append_exchange"}
     code_map: dict = {}     # {"type": "mapped", "col": "..."} 或 {"type": "computed", "from": "symbol", "method": "strip_exchange"}
+    market_level: bool = False  # 市场级表: 行=全市场每日一条, 无 symbol 列 (如择时状态序列)
 
 
 class UpdateExtReq(BaseModel):
@@ -62,12 +66,23 @@ class UpdateExtReq(BaseModel):
     description: str | None = None
     symbol_map: dict | None = None
     code_map: dict | None = None
+    market_level: bool | None = None
 
 
 class IngestReq(BaseModel):
     """JSON 批量写入请求。"""
     date: str | None = None          # YYYY-MM-DD，不传默认今天
     rows: list[dict] = Field(..., min_length=1)
+
+
+class PullAuthReq(BaseModel):
+    """拉取接口鉴权方式 (与自定义行情源 AuthConfig 同口径)。
+
+    Key 本体存 secrets_store (secrets.json), 不写入 config.json。
+    """
+    type: Literal["none", "bearer", "header", "query"] = "none"
+    header: str = Field("Authorization", min_length=1, max_length=64)  # bearer/header 用
+    param: str = Field("token", min_length=1, max_length=64)          # query 用
 
 
 class PullConfigReq(BaseModel):
@@ -80,8 +95,52 @@ class PullConfigReq(BaseModel):
     field_map: dict[str, str] | None = None  # external → internal field name
     schedule_minutes: int = Field(1440, ge=1)
     enabled: bool = False
+    # 每日固定拉取时刻 "HH:MM" (北京时间): 配置后按墙钟每天该时刻拉一次,
+    # 忽略 schedule_minutes; null = 间隔制 (清除固定时刻)
+    schedule_time: str | None = Field(
+        None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
+    )
+    # 固定时刻的重复周期: daily=每天 | weekly=每周 | monthly=每月 (仅 schedule_time 生效)
+    schedule_period: str | None = Field(None, pattern=r"^(daily|weekly|monthly)$")
+    # weekly: 1=周一..7=周日; monthly: 1..31 (短月无该日则该月跳过)
+    schedule_day: int | None = Field(None, ge=1, le=31)
+    # 仅交易日: 跳过周六日 (法定节假日无法离线判定, 仍会按期尝试, 拉取幂等)
+    schedule_trading_only: bool = False
     time_window_start: str | None = None   # "HH:MM", None=不限
     time_window_end: str | None = None     # "HH:MM", None=不限
+    # 接口按日查询的参数名 (如 "date"): 配置后支持历史回补, 且当日拉取也带日期参数
+    date_param: str | None = Field(None, min_length=1, max_length=16, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    # 日期参数值的格式: iso/compact/ts_s/ts_ms (时间戳=该交易日北京时间 00:00:00), 缺省 iso
+    date_format: str = "iso"
+    # 日内序列表时间列名 (字段映射后的列名, 如 "ts"): 配置后同 symbol 允许多行,
+    # 按 [symbol, time_field] 去重; 留空 = 每日快照表 (按 symbol 去重)
+    time_field: str | None = Field(None, max_length=32)
+    # 增量续传参数名 (如 "since"): 每次拉取自动带上本地目标日分区 time_field 的
+    # 最大值, 源只返回其后数据 (盘中多盘表免全量重拉); 需先配置 time_field
+    since_param: str | None = Field(None, min_length=1, max_length=16, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    # 序列粒度: auto=按数据形态自动判断 (时间列值含非零时刻→日内, 否则日级;
+    # 未配 time_field 恒为日级) | intraday=日内多盘 | daily=日级别。
+    # 决定 series 端点口径与列表迷你图形态
+    granularity: Literal["auto", "intraday", "daily"] = "auto"
+    # 鉴权方式; 请求中缺省 (None) = 保留现有配置, {"type":"none"} = 关闭鉴权
+    auth: PullAuthReq | None = None
+    # 单次拉取请求超时 (秒), 默认 30 与历史行为一致; 大响应接口可调高
+    timeout_seconds: int = Field(30, ge=5, le=300)
+    # ── 分页协议 (仅 GET; 页码经 query 参数传递) ──
+    # 必须与本类其它字段一样显式声明: Pydantic 默认忽略未声明键, 前端保存时
+    # 提交的 page_param/page_size_* 会被静默丢弃, 回读退化成单次请求。
+    page_param: str | None = Field(None, max_length=64)
+    page_size_param: str | None = Field(None, max_length=64)
+    page_size: int = Field(0, ge=0)
+    page_start: int = Field(1, ge=0)
+    max_pages: int = Field(20, ge=1, le=200)
+    # 两级拉取配方 (目录 → 逐条目明细); 缺省 (None) = 保留现有配置
+    fanout: dict | None = None
+
+
+class ApiKeyReq(BaseModel):
+    """设置拉取接口 API Key; 空串 = 清除。"""
+    key: str = Field(..., max_length=4096)
 
 
 class DetectUrlReq(BaseModel):
@@ -92,6 +151,9 @@ class DetectUrlReq(BaseModel):
     body: str | None = None
     response_path: str = ""
     field_map: dict[str, str] | None = None
+    # 探测超时; 与 PullConfig.timeout_seconds 同口径 (默认 30 与历史行为一致),
+    # 大响应接口 (如全量集合竞价 /day ~77s) 探测时需要更高超时
+    timeout_seconds: int = Field(30, ge=5, le=300)
 
 
 # ---------------------------------------------------------------------------
@@ -182,14 +244,39 @@ def _safe_json_value(value):
     return value
 
 
+def _partition_date(raw: str) -> str:
+    """把 `date` 入参规范成 `YYYY-MM-DD` 分区名。
+
+    这个值直接拼进分区目录名 (`timeseries/date=<value>`), 所以非法值不只是格式问题:
+    `date=x/../../../../kline_daily` 会让读取路径离开 `ext_data/<id>/timeseries/`。
+    同一文件的 `/sync`、`/ingest`、`/backfill` 都先 `date.fromisoformat` 再用, 只有
+    `/rows` 和 `/dimension-members` 走的这条路把原始字符串直接拼进了路径。
+    """
+    try:
+        return date.fromisoformat(raw).isoformat()
+    except ValueError as e:
+        raise HTTPException(400, f"日期格式错误: {raw}") from e
+
+
 def _read_ext_dataframe(
     config: ExtConfig,
     data_dir: Path,
     snapshot_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
 ) -> tuple[pl.DataFrame, str | None]:
+    """读取扩展表数据。
+
+    - snapshot: 当前快照 (不支持日期范围)。
+    - timeseries + snapshot_date: 单日分区 (历史行为)。
+    - timeseries + start_date/end_date (可只给一端): 范围内全部分区 concat,
+      active_date 返回 "首..末"。date 与范围同时给出时 date 优先。
+    """
     cfg_dir = data_dir / "ext_data" / config.id
 
     if config.mode == "snapshot":
+        if start_date or end_date:
+            raise HTTPException(400, "快照模式无历史分区, 不支持日期范围查询")
         path = cfg_dir / "part.parquet"
         if not path.exists():
             return pl.DataFrame(), None
@@ -200,10 +287,11 @@ def _read_ext_dataframe(
         return pl.DataFrame(), None
 
     if snapshot_date:
-        path = base / f"date={snapshot_date}" / "part.parquet"
+        day = _partition_date(snapshot_date)
+        path = base / f"date={day}" / "part.parquet"
         if not path.exists():
-            return pl.DataFrame(), snapshot_date
-        return pl.read_parquet(path), snapshot_date
+            return pl.DataFrame(), day
+        return pl.read_parquet(path), day
 
     partitions = sorted(
         d for d in base.iterdir()
@@ -211,6 +299,34 @@ def _read_ext_dataframe(
     )
     if not partitions:
         return pl.DataFrame(), None
+
+    if start_date or end_date:
+        lo = _partition_date(start_date) if start_date else None
+        hi = _partition_date(end_date) if end_date else None
+        if lo and hi and lo > hi:
+            raise HTTPException(400, f"start_date {lo} 晚于 end_date {hi}")
+        # ISO 日期字符串字典序 == 时间序, 分区名直接比较
+        selected = [
+            d for d in partitions
+            if (not lo or d.name[5:] >= lo) and (not hi or d.name[5:] <= hi)
+        ]
+        if not selected:
+            return pl.DataFrame(), None
+        # 每分区补行级日期列 (分区名): 表自带 date 列则用 data_date, 两者都有不再加。
+        # 没有它, 范围合并后消费方无法区分行来自哪一天。
+        frames = []
+        for d in selected:
+            f = pl.read_parquet(d / "part.parquet")
+            day = d.name[5:]
+            if "date" not in f.columns:
+                f = f.with_columns(pl.lit(day).alias("date"))
+            elif "data_date" not in f.columns:
+                f = f.with_columns(pl.lit(day).alias("data_date"))
+            frames.append(f)
+        # diagonal: 各分区 schema 可能不一致 (配置中途加字段 → 早期分区少列),
+        # 缺列自动补 null 并取超类型; 单分区时无需 concat
+        df = pl.concat(frames, how="diagonal") if len(frames) > 1 else frames[0]
+        return df, f"{selected[0].name[5:]}..{selected[-1].name[5:]}"
 
     latest = partitions[-1]
     latest_date = latest.name[5:]
@@ -234,10 +350,14 @@ def _with_instrument_name(df: pl.DataFrame, data_dir: Path) -> pl.DataFrame:
 
 
 def _latest_sync_date(config: ExtConfig, data_dir: Path) -> str | None:
-    """扫描数据文件，返回该扩展配置的最新同步时间（含时分秒）。
+    """扫描数据文件，返回该扩展配置的最新同步时间（北京墙钟, 含时分秒）。
 
     - snapshot: 直接取 ext_data/{id}/part.parquet 的 mtime
     - timeseries: 扫描 ext_data/{id}/timeseries/date=xxx 分区目录
+
+    用北京时间而非宿主机时钟: 前端 ExtDataStatCard 原样展示这串裸时间,
+    容器默认 UTC 时会比同一页拉取面板里的 pull.last_run(带时区 ISO,
+    浏览器按本地时区渲染)整整差一个时区。
     """
     from datetime import datetime
 
@@ -245,7 +365,7 @@ def _latest_sync_date(config: ExtConfig, data_dir: Path) -> str | None:
         # 快照: part.parquet 与 config.json 同级
         p = data_dir / "ext_data" / config.id / "part.parquet"
         if p.exists():
-            ts = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            ts = datetime.fromtimestamp(p.stat().st_mtime, tz=CN_TZ).strftime("%Y-%m-%d %H:%M:%S")
             return ts
         # 兼容旧路径
         old = data_dir / "instruments_ext"
@@ -264,7 +384,7 @@ def _latest_sync_date(config: ExtConfig, data_dir: Path) -> str | None:
 
 
 def _latest_sync_from_partitions(base: Path) -> str | None:
-    """从 date=xxx 分区目录中找到最新分区的修改时间。"""
+    """从 date=xxx 分区目录中找到最新分区的修改时间 (北京墙钟)。"""
     from datetime import datetime
     latest_ts: float = 0
     latest_date: str | None = None
@@ -276,7 +396,7 @@ def _latest_sync_from_partitions(base: Path) -> str | None:
                     latest_ts = mtime
                     latest_date = d.name[5:]
     if latest_date and latest_ts > 0:
-        ts = datetime.fromtimestamp(latest_ts).strftime("%H:%M:%S")
+        ts = datetime.fromtimestamp(latest_ts, tz=CN_TZ).strftime("%H:%M:%S")
         return f"{latest_date} {ts}"
     return latest_date
 
@@ -301,6 +421,84 @@ def _date_range(config: ExtConfig, data_dir: Path) -> list[str] | None:
     return [dates[0], dates[-1]]
 
 
+def _plate_stats(config: ExtConfig, data_dir: Path) -> dict | None:
+    """日内多盘表最新分区的盘次概览 (源卡片展示用)。
+
+    只读最新分区的时间列: 盘数 = 时刻值去重计数, from/to = 时刻范围 (HH:MM:SS,
+    与 collapse_ext_rows_at 的时刻切片同口径, 兼容 ISO 前缀/纯时刻两种列)。
+    非多盘表 (非 timeseries 或未配 time_field)、无分区、列缺失或文件损坏 → None。
+    """
+    if config.mode != "timeseries":
+        return None
+    tf = config.pull.time_field if config.pull else None
+    if not tf:
+        return None
+    base = _ext_data_dir(config, data_dir)
+    if not base.exists():
+        return None
+    parts = sorted(
+        d.name[5:] for d in base.iterdir()
+        if d.is_dir() and d.name.startswith("date=") and (d / "part.parquet").exists()
+    )
+    if not parts:
+        return None
+    try:
+        col = pl.read_parquet(
+            base / f"date={parts[-1]}" / "part.parquet", columns=[tf]
+        )[tf].cast(pl.Utf8)
+    except Exception:  # noqa: BLE001 — 列缺失/文件损坏 → 无多盘信息, 不阻断列表
+        return None
+    if col.is_empty():
+        return None
+    tod = (
+        pl.DataFrame({tf: col})
+        .select(
+            pl.when(pl.col(tf).str.len_chars() >= 11)
+            .then(pl.col(tf).str.slice(11, 8))
+            .otherwise(pl.col(tf))
+            .alias("_tod")
+        )
+        .select(
+            plates=pl.col("_tod").n_unique(),
+            first=pl.col("_tod").min(),
+            last=pl.col("_tod").max(),
+            # 粒度判定 (值形态, 比盘数稳): 存在「含冒号且非 00:00:00」的时刻值
+            # → 日内多盘; 全为日期形态 (无冒号) 或 00:00:00 → 日级别。
+            # 盘后只拉过一两次的日内表不会因此误判 (非零时刻仍在)。
+            intraday=(pl.col("_tod").str.contains(":") & (pl.col("_tod") != "00:00:00")).any(),
+        )
+        .row(0, named=True)
+    )
+    return {
+        "date": parts[-1],
+        "plates": tod["plates"],
+        "from": tod["first"],
+        "to": tod["last"],
+        "granularity": "intraday" if tod["intraday"] else "daily",
+    }
+
+
+def _granularity_effective(config: ExtConfig, data_dir: Path) -> str | None:
+    """序列粒度生效值: 显式声明 > 数据形态自动判断; snapshot 表 → None。
+
+    判断规则 (auto): 未配 time_field → daily (落盘契约「留空 = 每日快照表」);
+    配了 time_field 但尚无可读分区 → intraday (以配置意图为准, 与历史 UI 行为
+    一致); 有数据 → _plate_stats 的值形态判定。
+    """
+    if config.mode != "timeseries":
+        return None
+    declared = config.pull.granularity if config.pull else "auto"
+    if declared in ("intraday", "daily"):
+        return declared
+    tf = config.pull.time_field if config.pull else None
+    if not tf:
+        return "daily"
+    stats = _plate_stats(config, data_dir)
+    if stats is None:
+        return "intraday"
+    return stats["granularity"]
+
+
 @router.get("")
 def list_configs(request: Request):
     """列出所有扩展数据配置。"""
@@ -311,29 +509,10 @@ def list_configs(request: Request):
         d = c.to_dict()
         d["latest_sync_date"] = _latest_sync_date(c, data_dir)
         d["date_range"] = _date_range(c, data_dir)
+        d["plate"] = _plate_stats(c, data_dir)
+        d["granularity_effective"] = _granularity_effective(c, data_dir)
         items.append(d)
     return {"items": items}
-
-
-@router.post("/presets/{config_id}/fetch")
-async def fetch_preset_data(request: Request, config_id: str):
-    """手动触发内置预设 (概念/行业) 的数据拉取。
-
-    注意: 必须在 /{config_id}/... 动态路由之前声明, 否则 'presets' 会被当成 config_id。
-    与通用 pull/run 不同: 走 ext_presets 的结构转换 (接口的 concepts/industries
-    数组 → 拼接成字符串), 保证 schema 与现有数据一致。
-    """
-    from app.services.ext_presets import fetch_preset
-
-    try:
-        n = await fetch_preset(config_id, _data_dir(request))
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from e
-    except Exception as e:
-        raise HTTPException(400, f"拉取失败: {e}") from e
-
-    _refresh_views(request)
-    return {"status": "ok", "rows": n}
 
 
 @router.post("")
@@ -350,8 +529,10 @@ def create_config(request: Request, body: CreateExtReq):
         description=body.description,
         symbol_map=body.symbol_map,
         code_map=body.code_map,
+        market_level=body.market_level,
     )
     store.upsert(config)
+    _refresh_views(request)
     return config.to_dict()
 
 
@@ -372,7 +553,10 @@ def update_config(request: Request, config_id: str, body: UpdateExtReq):
         config.symbol_map = body.symbol_map
     if body.code_map is not None:
         config.code_map = body.code_map
+    if body.market_level is not None:
+        config.market_level = body.market_level
     store.upsert(config)
+    _refresh_views(request)
     return config.to_dict()
 
 
@@ -382,7 +566,48 @@ def delete_config(request: Request, config_id: str):
     store = _store(request)
     if not store.delete(config_id):
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
+    # 同步清掉 secrets.json 里残留的拉取 API Key, 避免同名重建配置时误用旧 Key
+    from app import secrets_store
+
+    secrets_store.clear(ext_api_key_field(config_id))
+    _refresh_views(request)
     return {"status": "deleted"}
+
+
+def _apply_row_filters(df: pl.DataFrame, filters: list[str] | None) -> pl.DataFrame:
+    """等值过滤: 每个条目 `field:v1|v2` (值间 OR); 多条目间 AND; 按字符串比较。
+
+    数值列的等值匹配走字符串口径 (1 → "1", 1.0 → "1.0"), 覆盖二开最常见的
+    "维度取值筛选"场景; 区间/模糊匹配暂不做, 留给真实需求出现。
+    """
+    if not filters:
+        return df
+    for entry in filters:
+        field, sep, raw_values = entry.partition(":")
+        field = field.strip()
+        values = [v for v in (raw_values.split("|") if sep else []) if v != ""]
+        if not field or not values:
+            raise HTTPException(400, f"过滤条件格式错误 (应为 字段:值1|值2): {entry}")
+        if field not in df.columns:
+            raise HTTPException(400, f"过滤字段不存在: {field} (可用: {df.columns})")
+        df = df.filter(pl.col(field).cast(pl.Utf8).is_in(values))
+    return df
+
+
+def _apply_row_sort(df: pl.DataFrame, sort: str | None) -> pl.DataFrame:
+    """排序: `field` 升序 / `field:desc` 降序; 未知字段 400。"""
+    if not sort:
+        return df
+    field, _, direction = sort.partition(":")
+    field = field.strip()
+    descending = direction.strip().lower() == "desc"
+    if field not in df.columns:
+        raise HTTPException(400, f"排序字段不存在: {field} (可用: {df.columns})")
+    return df.sort(field, descending=descending, nulls_last=True)
+
+
+# 模块级常量避免 B008 (参数默认值内的函数调用); 语义与行内 Query(...) 完全一致
+_ROW_FILTER_QUERY = Query(None, description="过滤 条件`字段:值1|值2`, 可重复多条 (AND)")
 
 
 @router.get("/{config_id}/rows")
@@ -392,27 +617,39 @@ def list_rows(
     snapshot_date: str | None = Query(None, alias="date"),
     columns: str | None = Query(None, description="逗号分隔的字段列表"),
     limit: int = Query(1000, ge=1, le=20000),
+    offset: int = Query(0, ge=0, le=1_000_000, description="分页偏移 (配合 limit/total)"),
+    filter: list[str] | None = _ROW_FILTER_QUERY,
+    sort: str | None = Query(None, description="排序字段, 降序加 :desc"),
+    start_date: str | None = Query(None, description="时序起始日期 YYYY-MM-DD (含)"),
+    end_date: str | None = Query(None, description="时序结束日期 YYYY-MM-DD (含)"),
 ):
     """读取扩展数据明细。
 
     - snapshot: 返回当前快照。
-    - timeseries: 默认返回最新日期分区，也可通过 date=YYYY-MM-DD 指定。
+    - timeseries: 默认返回最新日期分区; date=YYYY-MM-DD 指定单日;
+      start_date/end_date 取日期范围 (可只给一端), 全部分区合并返回。
+    - filter/sort/offset: 服务端过滤/排序/分页, 二开方无需一次拉全量自行筛。
     """
     config = _store(request).get(config_id)
     if not config:
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
 
     data_dir = _data_dir(request)
-    df, active_date = _read_ext_dataframe(config, data_dir, snapshot_date)
+    df, active_date = _read_ext_dataframe(config, data_dir, snapshot_date, start_date, end_date)
     df = _with_instrument_name(df, data_dir)
+    # 日内序列表: 按时间列升序, 保证分页/截断取到的是最早的盘
+    tf = config.pull.time_field if config.pull else None
+    if tf and tf in df.columns:
+        df = df.sort(tf)
+    df = _apply_row_filters(df, filter)
+    df = _apply_row_sort(df, sort)
+    total = len(df)
+    df = df.slice(offset, limit)
     requested = [c.strip() for c in (columns or "").split(",") if c.strip()]
     if requested:
         keep = [c for c in ["symbol", "code", "name", *requested] if c in df.columns]
         if keep:
             df = df.select(list(dict.fromkeys(keep)))
-    total = len(df)
-    if total > limit:
-        df = df.head(limit)
 
     rows = []
     for row in df.to_dicts():
@@ -424,9 +661,50 @@ def list_rows(
         "mode": config.mode,
         "date": active_date,
         "total": total,
+        "offset": offset,
         "limit": limit,
         "fields": [f.to_dict() for f in config.fields],
         "rows": rows,
+    }
+
+
+@router.get("/{config_id}/values")
+def field_values(
+    request: Request,
+    config_id: str,
+    field: str = Query(..., min_length=1, description="要枚举去重的字段名"),
+    snapshot_date: str | None = Query(None, alias="date"),
+    start_date: str | None = Query(None),
+    end_date: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """字段取值枚举 (去重 + 计数, 按出现次数降序)。
+
+    `/rows?filter=` 的配套端点: 二开方先取某字段的候选值做筛选下拉,
+    再带 filter 查明细。日期语义与 /rows 相同 (date 单日 / 范围 / 默认最新)。
+    """
+    config = _store(request).get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+
+    data_dir = _data_dir(request)
+    df, active_date = _read_ext_dataframe(config, data_dir, snapshot_date, start_date, end_date)
+    if field not in df.columns:
+        raise HTTPException(400, f"字段不存在: {field} (可用: {df.columns})")
+    counted = (
+        df.group_by(field).len().sort(["len", field], descending=[True, False]).head(limit)
+    )
+    values = [
+        {"value": _safe_json_value(row[field]), "count": row["len"]}
+        for row in counted.to_dicts()
+    ]
+    return {
+        "id": config.id,
+        "field": field,
+        "date": active_date,
+        "total": df.height,
+        "distinct": df[field].n_unique(),
+        "values": values,
     }
 
 
@@ -496,6 +774,10 @@ _DIMENSION_INTRADAY_CACHE: dict[tuple[str, str, str, str | None], tuple[float, d
 _DIMENSION_INTRADAY_CACHE_TTL_S = 60.0
 # 成分股网格化 ffill 上限: 超大板块退化为逐时间戳可得均值 (内存保护)。
 _DIMENSION_INTRADAY_FFILL_CAP = 2000
+# 分钟 pct 物理边界 (与 services.sector_rotation._PCT_PHYSICAL_BOUND 同值,
+# A 股日涨跌停最大 ±30%): 超出视为脏点剔除 (GH #473 同族)。
+_DIMENSION_INTRADAY_PCT_BOUND = 0.30
+_DIMENSION_INTRADAY_PCT_EPS = 1e-9  # 浮点容差: 130/100-1 略大于 0.30, 真涨停勿滤
 
 
 def _bare_symbol_expr(col: str = "symbol") -> pl.Expr:
@@ -541,6 +823,9 @@ def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
     return (
         df.with_columns(_bare_symbol_expr().alias("_bare"))
         .select([pl.col("_bare"), pl.col("close").cast(pl.Float64).alias("prev_close")])
+        # 前收 <= 0 / 非有限视为缺失 (否则 close/ref 为 inf, 整个响应 JSON 渲染 500),
+        # 缺失时由调用方退化为当日首根有效分钟 close
+        .filter(pl.col("prev_close").is_finite() & (pl.col("prev_close") > 0))
         .unique(subset=["_bare"], keep="last")
     )
 
@@ -589,7 +874,10 @@ def _dimension_intraday_compute(
     except Exception as exc:  # noqa: BLE001
         logger.warning("dimension-intraday read minute partition failed: %s", exc)
         return {"status": "no_data", "reason": "minute_schema", "date": target, "points": []}
-    bars = bars.drop_nulls(subset=["datetime", "close"])
+    # close <= 0 / 非有限的分钟行无效: 作基准时 pct 为 inf, 作分子时是 -100% 假跌幅
+    bars = bars.drop_nulls(subset=["datetime", "close"]).filter(
+        pl.col("close").cast(pl.Float64).is_finite() & (pl.col("close") > 0)
+    )
     if bars.is_empty():
         return {"status": "no_data", "reason": "minute_empty", "date": target, "points": []}
     bars = bars.with_columns(_bare_symbol_expr().alias("_bare"))
@@ -607,6 +895,8 @@ def _dimension_intraday_compute(
     joined = (
         joined.join(refs.select(["_bare", "_ref"]), on="_bare", how="left")
         .with_columns((pl.col("close") / pl.col("_ref") - 1.0).alias("_pct"))
+        # 物理边界外视为脏点剔除 (与 sector_rotation 同口径, GH #473 同族)
+        .filter(pl.col("_pct").abs() <= _DIMENSION_INTRADAY_PCT_BOUND + _DIMENSION_INTRADAY_PCT_EPS)
     )
 
     market = joined.group_by("datetime").agg(pl.col("_pct").mean().alias("_market"))
@@ -760,8 +1050,9 @@ async def upload_data(
     keep = [c for c in df.columns if c in all_config_cols]
     df = df.select(keep)
 
-    # 解析快照日期
-    snap = date.fromisoformat(snapshot_date) if snapshot_date else date.today()
+    # 解析快照日期: 非法值 400 (与 /rows 同一校验); 缺省按北京日期落盘,
+    # 服务器时区不能决定分区归属 (UTC 容器北京 08:00 前会写进前一天)
+    snap = date.fromisoformat(_partition_date(snapshot_date)) if snapshot_date else cn_today()
 
     rows = write_ext_parquet(df, config, _data_dir(request), snapshot_date=snap)
 
@@ -787,13 +1078,15 @@ def ingest_data(request: Request, config_id: str, body: IngestReq):
     configured = {f.name for f in config.fields}
     required = configured - {"symbol"}
     for i, row in enumerate(body.rows):
-        if "symbol" not in row:
+        # 市场级表 (无标的列) 不强制 symbol; 标的表仍要求逐行携带
+        if not config.market_level and "symbol" not in row:
             raise HTTPException(400, f"第 {i + 1} 行缺少 symbol 字段")
         missing = required - set(row.keys())
         if missing:
             raise HTTPException(400, f"第 {i + 1} 行缺少字段: {', '.join(sorted(missing))}")
 
-    snap = date.fromisoformat(body.date) if body.date else date.today()
+    # 同 /upload: 非法日期 400, 缺省按北京日期落盘
+    snap = date.fromisoformat(_partition_date(body.date)) if body.date else cn_today()
 
     rows_written = rows_to_parquet(body.rows, config, _data_dir(request), snapshot_date=snap)
 
@@ -814,8 +1107,25 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
     if not config:
         raise HTTPException(404, f"配置 '{config_id}' 不存在")
 
-    # 保留历史状态字段
+    # 保留历史状态字段; auth 缺省时沿用现有配置 (关闭鉴权需显式传 {"type":"none"})
     old_pull = config.pull
+    # auth.key_ref / fanout: UI 未暴露的键在保存时沿用旧值, 避免一次普通保存
+    # 就把出厂配方里的凭据引用与两级请求配方抹掉。
+    old_auth = (old_pull.auth or {}) if old_pull else {}
+    if body.auth is not None:
+        new_auth: dict | None = body.auth.model_dump()
+        if new_auth and old_auth.get("key_ref") and not new_auth.get("key_ref"):
+            new_auth["key_ref"] = old_auth["key_ref"]
+    else:
+        new_auth = old_pull.auth if old_pull else None
+    # 会话 Cookie 不能当服务间长期凭据: 保存时就拒绝, 让问题在配置阶段暴露,
+    # 而不是等 24 小时会话过期后定时拉取集体 401。
+    if new_auth:
+        from app.services.ext_pull import session_cookie_rejection
+
+        rejected = session_cookie_rejection(new_auth, get_ext_api_key(config_id))
+        if rejected:
+            raise HTTPException(400, rejected)
     config.pull = PullConfig(
         url=body.url,
         method=body.method,
@@ -825,8 +1135,25 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         field_map=body.field_map,
         schedule_minutes=body.schedule_minutes,
         enabled=body.enabled,
+        schedule_time=body.schedule_time,
+        schedule_period=body.schedule_period,
+        schedule_day=body.schedule_day,
+        schedule_trading_only=body.schedule_trading_only,
         time_window_start=body.time_window_start,
         time_window_end=body.time_window_end,
+        date_param=body.date_param,
+        date_format=body.date_format,
+        time_field=body.time_field,
+        since_param=body.since_param,
+        granularity=body.granularity,
+        auth=new_auth,
+        timeout_seconds=body.timeout_seconds,
+        page_param=body.page_param,
+        page_size_param=body.page_size_param,
+        page_size=body.page_size,
+        page_start=body.page_start,
+        max_pages=body.max_pages,
+        fanout=body.fanout if body.fanout is not None else (old_pull.fanout if old_pull else None),
         last_run=old_pull.last_run if old_pull else None,
         last_status=old_pull.last_status if old_pull else None,
         last_message=old_pull.last_message if old_pull else None,
@@ -847,6 +1174,43 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
     return {"status": "ok", "pull": config.pull.to_dict()}
 
 
+@router.get("/{config_id}/api-key")
+def get_pull_api_key(request: Request, config_id: str):
+    """查询拉取接口 API Key 状态。只返回脱敏值, 不返回明文。"""
+    store = _store(request)
+    config = store.get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+
+    from app import secrets_store
+
+    key = get_ext_api_key(config_id)
+    return {"key_set": bool(key), "masked_key": secrets_store.mask(key) if key else ""}
+
+
+@router.put("/{config_id}/api-key")
+def set_pull_api_key(request: Request, config_id: str, body: ApiKeyReq):
+    """设置 (或空串清除) 拉取接口的 API Key, 存 secrets.json (权限 0600)。"""
+    store = _store(request)
+    config = store.get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+
+    from app import secrets_store
+
+    value = body.key.strip()
+    if value:
+        from app.services.ext_pull import session_cookie_rejection
+
+        rejected = session_cookie_rejection(config.pull.auth if config.pull else None, value)
+        if rejected:
+            raise HTTPException(400, rejected)
+        secrets_store.save({ext_api_key_field(config_id): value})
+    else:
+        secrets_store.clear(ext_api_key_field(config_id))
+    return {"status": "ok", "key_set": bool(value), "masked_key": secrets_store.mask(value) if value else ""}
+
+
 @router.post("/{config_id}/pull/test")
 async def test_pull(request: Request, config_id: str):
     """测试拉取：请求外部 API 并返回预览数据，不写入。"""
@@ -857,23 +1221,12 @@ async def test_pull(request: Request, config_id: str):
     if not config.pull or not config.pull.url:
         raise HTTPException(400, "拉取未配置或 URL 为空")
 
-    # 临时构建一个带新配置的 config 用于测试
-    from app.services.ext_pull import _extract_rows, _apply_field_map
-    import httpx
+    # 复用正式拉取的请求实现 (UA 标识头 + 鉴权注入同一套口径), 不带日期参数
+    from app.services.ext_pull import _apply_field_map, _extract_rows
 
     pull = config.pull
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            headers = pull.headers or {}
-            kwargs: dict = {"headers": headers}
-            if pull.method.upper() == "POST" and pull.body:
-                kwargs["content"] = pull.body
-                if "content-type" not in {k.lower() for k in headers}:
-                    kwargs["headers"]["Content-Type"] = "application/json"
-            resp = await client.request(pull.method.upper(), pull.url, **kwargs)
-            resp.raise_for_status()
-            data = resp.json()
-
+        data = await _request_json(pull, config.id)
         rows = _extract_rows(data, pull.response_path)
         preview = _apply_field_map(rows[:5], pull.field_map)
         return {
@@ -921,6 +1274,38 @@ async def run_pull(request: Request, config_id: str):
         raise HTTPException(400, f"拉取失败: {e}") from e
 
 
+@router.post("/{config_id}/backfill")
+async def backfill_history_ep(
+    request: Request,
+    config_id: str,
+    start: str = Query(..., description="开始日期 YYYY-MM-DD"),
+    end: str = Query(..., description="结束日期 YYYY-MM-DD (含)"),
+):
+    """历史回补: 按本地交易日逐日拉取并写入 timeseries 分区。
+
+    前提: 配置为 timeseries 模式且拉取配置了 date_param (接口支持按日期
+    查询)。幂等 —— 已存在的分区跳过, 失败单日不中断, 结果逐项返回。
+    """
+    store = _store(request)
+    config = store.get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+    try:
+        start_d = date.fromisoformat(start)
+        end_d = date.fromisoformat(end)
+    except ValueError as e:
+        raise HTTPException(422, f"日期格式错误 (应为 YYYY-MM-DD): {e}") from e
+
+    from app.services.ext_pull import backfill_history
+
+    try:
+        result = await backfill_history(config, _data_dir(request), start_d, end_d)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    _refresh_views(request)
+    return {"status": "ok", **result}
+
+
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Symbol 格式修复
@@ -942,6 +1327,138 @@ def fix_symbol(request: Request, config_id: str):
 # ---------------------------------------------------------------------------
 # Schema 发现
 # ---------------------------------------------------------------------------
+
+
+def _daily_series(
+    config: ExtConfig,
+    data_dir: Path,
+    field: str,
+    date: str | None,
+    symbols: str | None,
+    days: int,
+) -> dict:
+    """日级粒度序列: 近 N 个分区, 每标的每日一值 [YYYY-MM-DD, value]。
+
+    分区日期为 x 轴 (无需 time_field); 表自带 date 列时优先用列值 (否则用
+    范围读注入的分区日期)。同日多行 (误配/补写) 取末个非空值 — 日末定型语义。
+    窗口按「实际存在的分区」截取近 N 个, 中途缺日不补点。
+    """
+    base = _ext_data_dir(config, data_dir)
+    partitions: list[str] = []
+    if base.exists():
+        partitions = sorted(
+            d.name[5:] for d in base.iterdir()
+            if d.is_dir() and d.name.startswith("date=") and (d / "part.parquet").exists()
+        )
+    if date:
+        target = _partition_date(date)
+        partitions = [p for p in partitions if p <= target]
+    empty = {
+        "config_id": config.id, "field": field, "granularity": "daily",
+        "date": partitions[-1] if partitions else None, "items": {},
+    }
+    if not partitions:
+        return empty
+    window = partitions[-days:]
+    df, _ = _read_ext_dataframe(config, data_dir, start_date=window[0], end_date=window[-1])
+    day_col = next((c for c in ("date", "data_date") if c in df.columns), None)
+    if df.is_empty() or field not in df.columns or day_col is None or "symbol" not in df.columns:
+        return empty
+
+    if symbols:
+        wanted = [s.strip() for s in symbols.split(",") if s.strip()]
+        df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(wanted))
+
+    points = (
+        df.select(
+            pl.col("symbol").cast(pl.Utf8).alias("symbol"),
+            pl.col(day_col).cast(pl.Utf8).alias("d"),
+            pl.col(field).cast(pl.Float64).alias("v"),
+        )
+        .filter(pl.col("v").is_not_null() & pl.col("d").is_not_null())
+        .sort(["symbol", "d"])
+        .group_by(["symbol", "d"], maintain_order=True)
+        .agg(pl.col("v").last())
+    )
+    items: dict[str, list[list[str | float]]] = {}
+    for row in points.iter_rows(named=True):
+        items.setdefault(row["symbol"], []).append([row["d"], float(row["v"])])
+    return {
+        "config_id": config.id,
+        "field": field,
+        "granularity": "daily",
+        "date": f"{window[0]}..{window[-1]}",
+        "days": len(window),
+        "items": items,
+    }
+
+
+@router.get("/{config_id}/series")
+def ext_series(
+    request: Request,
+    config_id: str,
+    field: str = Query(..., min_length=1, description="数值字段名"),
+    date: str | None = Query(None, description="YYYY-MM-DD, 缺省取最新分区; 日级粒度时为近N日窗口右端"),
+    symbols: str | None = Query(None, description="逗号分隔标的过滤, 缺省全表"),
+    days: int = Query(10, ge=1, le=60, description="日级粒度的近 N 日窗口"),
+):
+    """扩展列迷你图序列 — 生效粒度 (granularity) 决定口径。
+
+    - intraday (日内多盘, 如集合竞价): 每标的一天的 [HH:MM:SS, value] 点列;
+    - daily (日级别, 如主力净流入每日值): 每标的近 N 日、每日一值
+      [YYYY-MM-DD, value] — 分区日期为 x 轴, 无需 time_field; 同日多行取
+      末个非空值 (日末定型语义)。
+    value 为 null 的点剔除 (折线/柱状不画空点)。symbols 用于按可见页过滤,
+    控制响应体积; 无分区时 items 为空 (fail-closed, 不回退其他窗口)。
+    """
+    config = _store(request).get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+    if config.mode != "timeseries":
+        raise HTTPException(400, "仅时序扩展表支持序列查询")
+    data_dir = _data_dir(request)
+    effective = _granularity_effective(config, data_dir)
+    if effective == "daily":
+        return _daily_series(config, data_dir, field, date, symbols, days)
+    time_field = config.pull.time_field if config.pull else None
+    if not time_field:
+        raise HTTPException(400, "仅配置了时间列 (time_field) 的时序扩展表支持序列查询")
+
+    if date:
+        day = _partition_date(date)
+        path = data_dir / "ext_data" / config_id / "timeseries" / f"date={day}" / "part.parquet"
+        if not path.exists():
+            return {"config_id": config_id, "field": field, "granularity": "intraday", "date": day, "items": {}}
+    else:
+        df_all, active = _read_ext_dataframe(config, data_dir)
+        day = active
+        if df_all.is_empty():
+            return {"config_id": config_id, "field": field, "granularity": "intraday", "date": day, "items": {}}
+        path = None
+
+    df = pl.read_parquet(path) if path else df_all
+    if df.is_empty() or field not in df.columns or time_field not in df.columns:
+        return {"config_id": config_id, "field": field, "granularity": "intraday", "date": day, "items": {}}
+
+    if symbols:
+        wanted = [s.strip() for s in symbols.split(",") if s.strip()]
+        df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(wanted))
+
+    ts = pl.col(time_field).cast(pl.Utf8)
+    tod = pl.when(ts.str.len_chars() >= 11).then(ts.str.slice(11, 8)).otherwise(ts)
+    points = (
+        df.select(
+            pl.col("symbol").cast(pl.Utf8).alias("symbol"),
+            tod.alias("t"),
+            pl.col(field).cast(pl.Float64).alias("v"),
+        )
+        .filter(pl.col("v").is_not_null() & pl.col("t").is_not_null())
+        .sort(["symbol", "t"])
+    )
+    items: dict[str, list[list[str | float]]] = {}
+    for row in points.select("symbol", "t", "v").iter_rows(named=True):
+        items.setdefault(row["symbol"], []).append([row["t"], float(row["v"])])
+    return {"config_id": config_id, "field": field, "granularity": "intraday", "date": day, "items": items}
 
 
 @router.post("/detect-fields")
@@ -1014,15 +1531,16 @@ def _find_row_arrays(data, prefix: str = "", limit: int = 8) -> list[str]:
 @router.post("/detect-url")
 async def detect_url(body: DetectUrlReq):
     """请求外部 URL，自动检测 JSON 行数据的字段和标的代码列。"""
-    from app.services.ext_pull import _extract_rows, _apply_field_map
     import httpx
+
+    from app.services.ext_pull import _apply_field_map, _extract_rows
 
     method = body.method.upper()
     if method not in ("GET", "POST"):
         raise HTTPException(400, "仅支持 GET / POST")
 
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=body.timeout_seconds, follow_redirects=True) as client:
             headers = body.headers or {}
             kwargs: dict = {"headers": headers}
             if method == "POST" and body.body:
@@ -1078,6 +1596,27 @@ async def detect_url(body: DetectUrlReq):
     }
 
 
+def _describe_parquet_columns(glob: str) -> list[tuple[str, str]]:
+    """读取 Parquet 的 (列名, 类型), 类型用 DuckDB 类型名 (DOUBLE/BIGINT/VARCHAR…)。
+
+    DESCRIBE 的输出列名随 DuckDB 版本变化: 1.4 及以前是 data_type, 1.5 起是
+    column_type。写死任一名字都会在另一版本整体抛 BinderException, 使 schema
+    端点静默退回配置字段 (列对象只有 dtype 没有 type), 前端按 type 判断数值列
+    的下拉随之变空。这里按实际输出列名取值, 两个版本都可用。
+    """
+    import duckdb
+
+    # hive_partitioning=false: 时序表目录名形如 date=YYYY-MM-DD, DuckDB 默认据此
+    # 推断分区并在真实列之外多出一个 date 列, 污染列选择器里的扩展字段。
+    rel = duckdb.query(
+        f"DESCRIBE SELECT * FROM read_parquet('{glob}', union_by_name=true, hive_partitioning=false)"
+    )
+    names = rel.columns
+    type_idx = names.index("column_type" if "column_type" in names else "data_type")
+    name_idx = names.index("column_name")
+    return [(row[name_idx], row[type_idx]) for row in rel.fetchall()]
+
+
 @router.get("/schema/{config_id}")
 def discover_schema(request: Request, config_id: str):
     """发现扩展数据的实际 Parquet schema（基于已有数据）。"""
@@ -1089,14 +1628,15 @@ def discover_schema(request: Request, config_id: str):
     glob = _parquet_glob(config, data_dir)
 
     try:
-        import duckdb
-        rows = duckdb.query(
-            f"SELECT column_name, data_type FROM (DESCRIBE SELECT * FROM read_parquet('{glob}', union_by_name=true))"
-        ).fetchall()
-        return {"columns": [{"name": r[0], "type": r[1]} for r in rows]}
+        return {"columns": [
+            {"name": name, "type": dtype}
+            for name, dtype in _describe_parquet_columns(glob)
+        ]}
     except Exception:
-        # 无数据时返回配置中定义的字段
-        return {"columns": [f.to_dict() for f in config.fields]}
+        # 无数据时返回配置中定义的字段 — 键名与真实 schema 对齐 (type 而非 dtype)
+        return {"columns": [
+            {"name": f.name, "type": f.dtype, "label": f.label} for f in config.fields
+        ]}
 
 
 @router.get("/schema-all")
@@ -1109,19 +1649,26 @@ def discover_all_schemas(request: Request):
         glob = _parquet_glob(config, data_dir)
 
         try:
-            import duckdb
-            cols = duckdb.query(
-                f"SELECT column_name, data_type FROM (DESCRIBE SELECT * FROM read_parquet('{glob}', union_by_name=true))"
-            ).fetchall()
             field_labels = {f.name: f.label for f in config.fields}
-            columns = [{"name": r[0], "type": r[1], "label": field_labels.get(r[0], r[0])} for r in cols]
+            columns = [
+                {"name": name, "type": dtype, "label": field_labels.get(name, name)}
+                for name, dtype in _describe_parquet_columns(glob)
+            ]
         except Exception:
-            columns = [f.to_dict() for f in config.fields]
+            columns = [
+                {"name": f.name, "type": f.dtype, "label": f.label} for f in config.fields
+            ]
 
         result.append({
             "id": config.id,
             "label": config.label,
             "mode": config.mode,
+            # 日内多盘表的时间列名 (pull.time_field): 前端据此展示「选盘时刻/迷你图」
+            # 列配置; snapshot 表与未配置时间列的表为 null
+            "time_field": (config.pull.time_field if config.pull else None),
+            # 生效粒度: intraday=日内多盘 (当日逐盘) | daily=日级别 (近N日) |
+            # null=snapshot 表。列表列自定义器据此选择迷你图形态与序列口径
+            "granularity": _granularity_effective(config, data_dir),
             "columns": columns,
         })
     return {"items": result}
@@ -1180,3 +1727,9 @@ def _refresh_views(request: Request) -> None:
                     db.execute(sql)
             except Exception:
                 pass
+
+    # 扩展列已接入 enriched 帧 (compute_signals/compute_enriched_today 注入):
+    # repo 内存 enriched 缓存 (_enriched_cache/_etf_/_index_) 持有含旧扩展列的
+    # 帧, 必须一并清理, 否则写入后监控/列表仍用旧值 (服务层已清扩展帧与策略缓存)。
+    if hasattr(repo, "clear_cache"):
+        repo.clear_cache()

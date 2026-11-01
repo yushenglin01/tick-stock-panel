@@ -1,10 +1,10 @@
-"""自选股 API。"""
+"""自选 API。"""
 from __future__ import annotations
 
 import logging
 import math
 import time
-from datetime import date
+from datetime import UTC, date, datetime
 from typing import Callable
 
 import anyio
@@ -13,6 +13,12 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
 from app.db_safe import is_valid_ext_ident, quote_ident
+from app.market_time import CN_TZ
+from app.price_limits import (
+    polars_is_risk_warning_name,
+    polars_limit_price,
+    polars_price_limit_pct,
+)
 from app.services import watchlist
 from app.services.watchlist_csv import import_watchlist_codes, import_watchlist_csv
 from app.services.watchlist_ocr import import_watchlist_image
@@ -40,6 +46,28 @@ _IMPORT_CSV_TYPES = {
     "text/plain",
     "application/csv",
 }
+# 上传分块读取粒度 (与 ext_data 上传一致)
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int, too_large: str) -> bytes:
+    """分块读取上传内容, 累计超过 max_bytes 立即拒绝(400), 返回完整字节。
+
+    与 ext_data._write_upload_capped 同类保护: 一次性 `await file.read()` 会先把整个
+    文件读入内存再比较长度, 上限在那之后才生效, 一个远超上限的上传照样把进程内存
+    顶满; 分块读取在越过上限的那一块就停止, 内存占用不超过上限 + 一块。
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(400, too_large)
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 class AddRequest(BaseModel):
@@ -186,11 +214,9 @@ async def import_from_image(request: Request, file: UploadFile = File(...)):
     if not ok_type and not ok_ext:
         raise HTTPException(400, "仅支持 JPG / PNG / WebP / BMP / GIF 图片")
 
-    data = await file.read()
+    data = await _read_upload_capped(file, _MAX_IMPORT_IMAGE_BYTES, "图片过大（上限 12MB）")
     if not data:
         raise HTTPException(400, "空文件")
-    if len(data) > _MAX_IMPORT_IMAGE_BYTES:
-        raise HTTPException(400, "图片过大（上限 12MB）")
 
     existing = {r["symbol"] for r in watchlist.list_symbols()}
     data_dir = request.app.state.repo.store.data_dir
@@ -242,11 +268,9 @@ async def import_from_csv(request: Request, file: UploadFile = File(...)):
     if not ok_type and not ok_ext:
         raise HTTPException(400, "仅支持 CSV / TXT 文件")
 
-    data = await file.read()
+    data = await _read_upload_capped(file, _MAX_IMPORT_CSV_BYTES, "文件过大（上限 5MB）")
     if not data:
         raise HTTPException(400, "空文件")
-    if len(data) > _MAX_IMPORT_CSV_BYTES:
-        raise HTTPException(400, "文件过大（上限 5MB）")
 
     data_dir = request.app.state.repo.store.data_dir
     # 解码与自选/instruments parquet 读取为同步 CPU/IO，挪线程池避免卡事件循环
@@ -334,7 +358,8 @@ def clear_all():
 
 # 自选页需要的列
 _WATCHLIST_COLS = [
-    "symbol", "close", "open", "high", "low", "change_pct", "change_amount", "amount",
+    "symbol", "close", "open", "high", "low", "prev_close", "volume",
+    "change_pct", "change_amount", "amount",
     "turnover_rate",
     "amplitude", "annual_vol_20d",
     "vol_ratio_5d",
@@ -357,12 +382,89 @@ _WATCHLIST_COLS = [
 ]
 
 
+def _added_dates_bj(entries: list[dict]) -> dict[str, date]:
+    """自选条目的 added_at (naive UTC ISO 串) → 北京日期; 空值/非法值跳过该条。
+
+    added_at 由 watchlist.add_batch 以 datetime.utcnow() 写入 (无 Z 后缀), 属 UTC 语义;
+    必须显式按 UTC 解析再转北京 —— 否则北京时间 00:00-08:00 加入的记录会被算到前一天。
+    换算惯例同 backtest/minute_replay.py, 服务器本地时区不参与 (CONTRIBUTING §3.3)。
+    """
+    out: dict[str, date] = {}
+    for entry in entries:
+        raw = entry.get("added_at")
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(str(raw))
+        except (ValueError, TypeError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        out[entry["symbol"]] = dt.astimezone(CN_TZ).date()
+    return out
+
+
+def _added_base_closes(
+    repo,
+    added_dates: dict[str, date],
+    stock_symbols: set[str],
+) -> pl.DataFrame:
+    """取各标的「加入日或之前最近一个交易日」的前复权收盘价, 作为区间收益基准。
+
+    返回 symbol/base_close 两列表; 无可用值返回空表, 由调用方按 null 降级。
+
+    - **只覆盖股票**: 内存历史缓存 (get_enriched_range) 仅含股票, ETF/指数只有最新日
+      缓存, 逐只回补会在行情 tick 热路径上形成 N+1 parquet 扫描, 故显式降级为「—」。
+    - **基准日取 <= 加入日**: 周末/节假日/停牌自然回落到前一交易日。与 K 线竖线的
+      「不 snap」有意不同 —— 价格口径可以回落, 日期事实不行。
+    - **超出缓存窗口 (约 300 个自然日) 的标的直接跳过**, 不触发 scan 兜底。
+    """
+    stock_targets = {s: d for s, d in added_dates.items() if s in stock_symbols}
+    if not stock_targets:
+        return pl.DataFrame()  # 没有可算的股票标的 → 不碰 repo
+    span = repo.get_enriched_history_span()
+    if span is None:
+        return pl.DataFrame()
+    span_start, span_end = span
+    in_range = {s: d for s, d in stock_targets.items() if d >= span_start}
+    if len(in_range) < len(stock_targets):
+        logger.debug(
+            "自选加入后涨跌幅: %d/%d 只早于可查询历史 (%s 之前), 降级为 null",
+            len(stock_targets) - len(in_range), len(stock_targets), span_start,
+        )
+    if not in_range:
+        return pl.DataFrame()
+    # 窗口必须钳制在缓存区间内: get_enriched_range 是全有或全无的 (cache_min > start
+    # 或 cache_max < end 即整体返回 None), 一只越界的标的会让全部标的失去基准价。
+    # start > end 只出现在「加入日晚于缓存末日」(本地数据未同步) 时, 退化为取缓存末日。
+    end = min(max(in_range.values()), span_end)
+    start = min(min(in_range.values()), end)
+    hist = repo.get_enriched_range(
+        start, end, symbols=list(in_range), columns=["symbol", "date", "close"]
+    )
+    if hist is None or hist.is_empty():
+        return pl.DataFrame()
+    added = pl.DataFrame(
+        {"symbol": list(in_range), "added_date": list(in_range.values())},
+        schema={"symbol": pl.Utf8, "added_date": pl.Date},
+    )
+    return (
+        hist.join(added, on="symbol", how="inner")
+        .filter(pl.col("date") <= pl.col("added_date"))
+        .group_by("symbol")
+        .agg(pl.col("close").sort_by(pl.col("date")).last().alias("base_close"))
+    )
+
+
 @router.get("/enriched")
 def watchlist_enriched(
     request: Request,
     ext_columns: str | None = Query(None, description="逗号分隔的 ext 列: config_id.field_name"),
 ):
-    """自选股 enriched 数据 — 直接从 enriched 最新日读取, 无即时计算。
+    """自选 enriched 数据 — 直接从 enriched 最新日读取, 无重计算。
+
+    仅两列为按行向量化现算 (不落盘): 涨跌停价, 以及「加入后涨跌幅」(pct_since_added,
+    以加入日收盘价为基准)。本端点在行情 tick 热路径上被反复调用, 故不做历史 scan 兜底。
 
     ext_columns 参数示例: "industry_rating.score,fund_flow.net_inflow"
     会动态 LEFT JOIN 对应的 ext_{config_id} DuckDB view。
@@ -370,9 +472,11 @@ def watchlist_enriched(
     t0 = time.perf_counter()
 
     repo = request.app.state.repo
-    symbols = [r["symbol"] for r in watchlist.list_symbols()]
+    entries = watchlist.list_symbols()
+    symbols = [r["symbol"] for r in entries]
     if not symbols:
-        return {"rows": [], "as_of": None, "elapsed_ms": 0}
+        return {"rows": [], "as_of": None, "elapsed_ms": 0,
+                "dates": {"stock": None, "etf": None, "index": None}}
 
     # 按资产拆分自选 symbol; ETF enriched 是独立缓存, 仅自选真的含 ETF 才去加载
     # (避免无 ETF 用户在缓存冷启动时触发 ETF 全量懒加载)
@@ -387,7 +491,7 @@ def watchlist_enriched(
     # 以自选列表为主表 LEFT JOIN enriched, 保证自选的每一只都返回一行;
     # 不在 enriched 缓存里的标的 (新股/冷门股/新用户未同步) 指标为 null, 前端渲染为 "—".
     # 旧实现是 df_e.filter(is_in(stock_symbols)), 方向反了 (以 enriched 为主),
-    # 会把不在缓存 universe 里的自选股静默丢弃.
+    # 会把不在缓存 universe 里的自选静默丢弃.
     if stock_symbols:
         watchlist_df = pl.DataFrame({"symbol": stock_symbols})
         if df_e.is_empty():
@@ -423,8 +527,18 @@ def watchlist_enriched(
     # as_of 取三类缓存中较旧者
     dates = [d for d in (cache_date if stock_symbols else None, etf_date, index_date) if d is not None]
     as_of = min(dates) if dates else None
+    # 按资产类型的行情日期 (ISO): as_of 是三类取 min 的全局值, 分不清哪类过期。
+    # 前端分时缩略图续画据此判定「该类行情是否为当日」—— ETF 未开实时拉取时
+    # etf 缓存停在旧日, 过期 close 拼到当日分钟K尾部会画出错价 (issue 场景)。
+    # None = 未加载/无缓存, 前端一律按不新鲜处理 (fail-closed)。
+    quote_dates = {
+        "stock": str(cache_date) if cache_date else None,
+        "etf": str(etf_date) if etf_date else None,
+        "index": str(index_date) if index_date else None,
+    }
     if df.is_empty():
-        return {"rows": [], "as_of": str(as_of) if as_of else None, "elapsed_ms": 0}
+        return {"rows": [], "as_of": str(as_of) if as_of else None,
+                "elapsed_ms": 0, "dates": quote_dates}
 
     # JOIN float_shares (仅股票有) + 名称 (股票/ETF 统一走 get_name_map)
     df_i = repo.get_instruments()
@@ -445,18 +559,86 @@ def watchlist_enriched(
     keep = [c for c in _WATCHLIST_COLS + ["name", "float_shares", "asset_type"] if c in df.columns]
     df = df.select(keep)
 
+    # 涨跌停价 (交易所整数分半进位口径, 仅股票): prev_close/名称已在行上, 对自选的
+    # 几十~几百行向量化现算为亚毫秒级, 不写回 enriched 存储。ETF (跨境/债券 5% 等)
+    # 与指数的涨跌幅规则不在 price_limits 覆盖内, 置 null 由前端渲染 "—"。
+    as_of_date = as_of if isinstance(as_of, date) else None
+    if as_of_date is None and as_of:
+        try:
+            as_of_date = date.fromisoformat(str(as_of)[:10])
+        except ValueError:
+            as_of_date = None
+    if {"symbol", "prev_close", "name", "asset_type"}.issubset(df.columns) and as_of_date is not None:
+        pct = polars_price_limit_pct(
+            pl.col("symbol"),
+            pl.lit(as_of_date),
+            polars_is_risk_warning_name(pl.col("name")),
+        )
+        stock_with_prev = (pl.col("asset_type") == "stock") & pl.col("prev_close").is_not_null()
+        df = df.with_columns(
+            pl.when(stock_with_prev)
+            .then(polars_limit_price(pl.col("prev_close"), pct, up=True))
+            .otherwise(None)
+            .alias("limit_up_price"),
+            pl.when(stock_with_prev)
+            .then(polars_limit_price(pl.col("prev_close"), pct, up=False))
+            .otherwise(None)
+            .alias("limit_down_price"),
+        )
+
+    # 「加入日期」与「加入以来」— 与涨跌停价同为读时现算, 不落盘。只在这一处挂一次即
+    # 覆盖 stock/etf/index 三分支。pct_since_added 为小数口径 (与 momentum_* 一致)。
+    try:
+        added_at_df = pl.DataFrame(
+            {
+                "symbol": symbols,
+                # 旧 schema 迁移补的空串归一为 null, 前端只需判断一种「缺失」
+                "added_at": [(r.get("added_at") or None) for r in entries],
+            },
+            schema={"symbol": pl.Utf8, "added_at": pl.Utf8},
+        )
+        with_base = df.join(added_at_df, on="symbol", how="left")
+        base_df = _added_base_closes(repo, _added_dates_bj(entries), set(stock_symbols))
+        if base_df.is_empty():
+            # 无基准价 (缓存冷 / 全为 ETF 或超窗): 整列降级为 null
+            df = with_base.with_columns(pl.lit(None, dtype=pl.Float64).alias("pct_since_added"))
+        else:
+            # 整链算完再回绑 df, 异常时 df 保持原样
+            df = (
+                with_base.join(base_df, on="symbol", how="left")
+                .with_columns(
+                    pl.when(
+                        pl.col("base_close").is_not_null()
+                        & pl.col("base_close").is_finite()
+                        & (pl.col("base_close") > 0)
+                        & pl.col("close").is_not_null()
+                    )
+                    .then(pl.col("close") / pl.col("base_close") - 1.0)
+                    .otherwise(None)
+                    .alias("pct_since_added")
+                )
+                .drop("base_close")
+            )
+    except Exception as e:
+        # 装饰列失败不得影响自选主表; 两列必须存在 (值可为 null), 否则前端排序/筛选静默失效
+        logger.warning("自选加入日期/加入后涨跌幅计算跳过: %s", e, exc_info=True)
+        df = df.with_columns(
+            pl.lit(None, dtype=pl.Utf8).alias("added_at"),
+            pl.lit(None, dtype=pl.Float64).alias("pct_since_added"),
+        )
+
     # 动态 JOIN 扩展数据表
     ext_specs = _parse_ext_columns(ext_columns) if ext_columns else []
     if ext_specs:
         db = repo.store.db
         data_dir = repo.store.data_dir
-        from app.services.ext_data import ExtConfigStore
         from app.api.ext_data import _read_ext_dataframe
+        from app.services.ext_data import ExtConfigStore, collapse_ext_rows_at
 
         ext_store = ExtConfigStore(data_dir)
         configs = {c.id: c for c in ext_store.load_all()}
 
-        for config_id, field_name in ext_specs:
+        for config_id, field_name, at in ext_specs:
             view_name = f"ext_{config_id}"
             ext_col_name = f"{config_id}__{field_name}"
             try:
@@ -469,10 +651,11 @@ def watchlist_enriched(
                         f"SELECT symbol, {quote_ident(field_name)} FROM {view_name}"
                     ).arrow())
                 if not ext_df.is_empty() and "symbol" in ext_df.columns:
+                    time_field = cfg.pull.time_field if cfg and cfg.pull else None
+                    # 收敛在 select 之前: 时间列被裁掉后 collapse 会静默回退末行
                     ext_df = (
-                        ext_df
+                        collapse_ext_rows_at(ext_df, at, time_field)
                         .select(["symbol", field_name])
-                        .unique(subset=["symbol"], keep="last")
                         .rename({field_name: ext_col_name})
                     )
                     df = df.join(ext_df.select(["symbol", ext_col_name]), on="symbol", how="left")
@@ -511,19 +694,32 @@ def watchlist_enriched(
 
     rows = df.to_dicts()
     elapsed = (time.perf_counter() - t0) * 1000
-    return {"rows": rows, "as_of": str(as_of) if as_of else None, "elapsed_ms": elapsed}
+    return {"rows": rows, "as_of": str(as_of) if as_of else None,
+            "elapsed_ms": elapsed, "dates": quote_dates}
 
 
-def _parse_ext_columns(ext_columns: str) -> list[tuple[str, str]]:
-    """解析 'config_id1.field1,config_id2.field2' 为 [(config_id, field_name), ...]"""
+def _parse_ext_columns(ext_columns: str) -> list[tuple[str, str, str | None]]:
+    """解析 'config_id1.field1@09:20,config_id2.field2' 为 [(config_id, field_name, at), ...]。
+
+    "@HH:MM[:SS]" 为日内多盘表的选盘时刻 (该时刻或之前最近一盘), 与 screener 同口径。
+    """
+    from app.services.ext_data import norm_ext_snapshot_at
+
     result = []
     for part in ext_columns.split(","):
         part = part.strip()
         if "." not in part:
             continue
         config_id, field_name = part.split(".", 1)
+        at: str | None = None
+        if "@" in field_name:
+            field_name, at_raw = field_name.rsplit("@", 1)
+            try:
+                at = norm_ext_snapshot_at(at_raw)
+            except ValueError:
+                continue
         config_id = config_id.strip()
         field_name = field_name.strip()
-        if config_id and field_name and is_valid_ext_ident(config_id):
-            result.append((config_id, field_name))
+        if config_id and field_name and is_valid_ext_ident(config_id) and "\x00" not in field_name:
+            result.append((config_id, field_name, at))
     return result

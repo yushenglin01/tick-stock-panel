@@ -40,6 +40,68 @@ def _matrix_entry_score(matrix: MarketMatrix, time_id: int, asset_id: int) -> fl
     return float(matrix.score[source_time, asset_id])
 
 
+def _apply_position_policy(
+    config: MatcherConfig,
+    candidates: list[tuple[str, float]],
+    recent_returns: dict[str, np.ndarray],
+    trades: list[TradeRecord],
+    cash: float,
+    equity: float,
+    peak: float,
+    open_positions: int,
+    execution_stats: dict,
+) -> tuple[np.ndarray, float]:
+    """自定义仓位策略 → (候选权重, 总预算缩放)。矩阵/legacy 两路径共用。
+
+    fail-closed 兜底: compute 抛错或输出非法时当日回退等权、scale=1, 并计入
+    execution_stats["position_policy_fallback"] 供结果统计暴露 — 不中断整个回测,
+    也绝不静默给出未经校验的仓位 (normalize_result 内强校验)。
+    """
+    n = len(candidates)
+    fallback = (np.repeat(1.0 / n, n), 1.0)
+    compute = config.position_policy_compute
+    if n == 0 or compute is None:
+        return fallback
+    from app.backtest.position_sizing import (  # 按需导入: 默认路径零加载成本
+        Candidate,
+        PortfolioState,
+        PositionSizingContext,
+        TradeSnapshot,
+        normalize_result,
+    )
+
+    try:
+        snapshots = tuple(
+            TradeSnapshot(
+                symbol=str(t.symbol),
+                pnl_pct=float(t.pnl_pct),
+                duration=int(t.duration),
+                exit_reason=str(t.exit_reason),
+            )
+            for t in trades[-50:]
+        )
+        drawdown = (equity - peak) / peak if peak > 0 else 0.0
+        ctx = PositionSizingContext(
+            selected=tuple(Candidate(symbol=s, score=float(v)) for s, v in candidates),
+            recent_returns={s: [float(x) for x in r] for s, r in recent_returns.items()},
+            closed_trades=snapshots,
+            portfolio=PortfolioState(
+                cash=float(cash),
+                equity=float(equity),
+                drawdown=drawdown,
+                open_positions=int(open_positions),
+            ),
+            params=dict(config.position_policy_params or {}),
+        )
+        weights, scale = normalize_result(compute(ctx), n)
+        return np.asarray(weights, dtype=np.float64), scale
+    except Exception:  # noqa: BLE001 — 用户代码运行期异常 → 当日兜底等权
+        execution_stats["position_policy_fallback"] = (
+            execution_stats.get("position_policy_fallback", 0) + 1
+        )
+        return fallback
+
+
 # ================================================================
 # 数据结构
 # ================================================================
@@ -68,10 +130,17 @@ class MatcherConfig:
     score_min: float | None = None
     score_max: float | None = None
     initial_capital: float = 1_000_000.0
-    position_sizing: Literal["equal", "score_weight"] = "equal"
+    position_sizing: Literal["equal", "score_weight", "policy"] = "equal"
+    # 自定义仓位策略 (position_sizing="policy"): 运行期由 strategy 层解析注入,
+    # 引擎不接触注册表/磁盘 — compute 为纯函数, params 为 META 默认值合并请求值。
+    # 这两个字段不参与任何缓存键/序列化。
+    position_policy_compute: Callable[..., object] | None = None
+    position_policy_params: dict | None = None
     # 分钟K精确成交: 开启后, 信号触发日的成交价用当日分钟K优化
     # (有参考线→穿越价, 无参考线→VWAP)。数据缺失时降级为日K口径。
     minute_fill: bool = False
+    # 回测资产类型: 分钟K按资产类型分开存储, 精确成交据此路由分钟分区 (不凭代码格式猜测)。
+    asset_type: str = "stock"
 
     def __post_init__(self) -> None:
         # 解析最终口径: 优先 entry_fill/exit_fill, 否则回退到 matching (向后兼容)。
@@ -300,6 +369,14 @@ class PanelCache:
         return f"{asset_type}:{generation or 'unmanaged'}:{h}:{start}:{end}:{cols}"
 
 
+# 等待进行中 enriched 发布的上限与轮询间隔。孤儿标记由 get_enriched_generation
+# 在读取时直接自愈, 因此这里等到的 EnrichedGenerationUnavailableError 意味着
+# 发布方确实存活 —— 对回测/优化这类长任务, 有界等待优于立即失败。仅用于
+# worker 任务路径 (矩阵加载), 实时热路径不得调用 data_generation_await。
+_GENERATION_WAIT_TIMEOUT_S = 300.0
+_GENERATION_POLL_S = 1.0
+
+
 # ================================================================
 # BacktestEngine
 # ================================================================
@@ -314,8 +391,36 @@ class BacktestEngine:
     # ── 数据加载 ──────────────────────────────────────
 
     def data_generation(self, asset_type: str = "stock") -> str | None:
+        from app.services.daily_health import assert_usable
+
+        root = getattr(getattr(self.repo, "store", None), "data_dir", None)
+        if root is not None:
+            assert_usable(root, asset_type)
         loader = getattr(self.repo, "get_matrix_data_generation", None)
         return loader(asset_type) if callable(loader) else None
+
+    def data_generation_await(
+        self,
+        asset_type: str = "stock",
+        *,
+        cancel_event: threading.Event | None = None,
+        timeout_s: float = _GENERATION_WAIT_TIMEOUT_S,
+    ) -> str | None:
+        """获取 generation; 发布进行中时在超时窗口内轮询, 可被取消事件打断。"""
+        deadline = time.monotonic() + timeout_s
+        from app.services.daily_health import DailyIntegrityError
+
+        while True:
+            try:
+                return self.data_generation(asset_type)
+            except DailyIntegrityError:
+                raise
+            except EnrichedGenerationUnavailableError:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(_GENERATION_POLL_S)
 
     def assert_data_generation(
         self,
@@ -341,11 +446,14 @@ class BacktestEngine:
         expected_generation: str | None = None,
     ) -> pl.DataFrame:
         """加载 enriched 数据面板，带缓存。asset_type='etf' 时读 ETF enriched。"""
-        attempts = 1 if expected_generation is not None else 2
+        # 快照世代路径也给一次重试 (issue #517): 盘中刷新每轮换新 generation,
+        # 读后校验失败时重读「现役世代」而不是死等已作废的旧世代。
+        attempts = 2
+        expected = expected_generation
         for attempt in range(attempts):
             generation = (
-                expected_generation
-                if expected_generation is not None
+                expected
+                if expected is not None
                 else self.data_generation(asset_type)
             )
             panel = self._cache.get_or_compute(
@@ -362,6 +470,7 @@ class BacktestEngine:
             except EnrichedGenerationUnavailableError:
                 if attempt + 1 >= attempts:
                     raise
+                expected = None
                 continue
             return panel
         raise EnrichedGenerationUnavailableError(
@@ -491,6 +600,22 @@ class BacktestEngine:
             | set(feature_plan.instrument_columns)
             | set(feature_plan.matrix_columns)
         )
+        # 扩展时序数值字段不进 parquet 解析 (enriched 只落 14 存储列), 矩阵构建后
+        # 按 (日期, 标的) 对齐现场注入 — 与财务因子 attach 同构。快照模式/字符串
+        # 字段/未注册名在此拦截 (快照回看历史 = 未来函数)。
+        from app.factors.ext_factors import numeric_timeseries_ext_columns
+
+        ext_wanted = frozenset(c for c in field_columns if c.startswith("ext_"))
+        if ext_wanted:
+            invalid_ext = ext_wanted - numeric_timeseries_ext_columns(
+                self.repo.store.data_dir
+            )
+            if invalid_ext:
+                raise ValueError(
+                    f"扩展字段不可用于矩阵回测 (需为时序模式的数值扩展字段): "
+                    f"{sorted(invalid_ext)}"
+                )
+            field_columns = field_columns - ext_wanted
         cache_root = (
             self.repo.store.data_dir / ".backtest_matrix_cache"
             if settings.backtest_matrix_disk_cache_enabled
@@ -501,22 +626,20 @@ class BacktestEngine:
             if cache_profile is not None
             else frozenset(field_columns)
         )
+        cache_fields = frozenset(cache_fields) - ext_wanted
         cache_max_bytes = (
             cache_profile.max_disk_bytes
             if cache_profile is not None
             else settings.backtest_matrix_cache_max_mb * 1024 * 1024
         )
-        generation_loader = getattr(self.repo, "get_matrix_data_generation", None)
         source_generation = (
             expected_generation
             if expected_generation is not None
-            else (
-                generation_loader(asset_type)
-                if callable(generation_loader)
-                else None
-            )
+            else self.data_generation_await(asset_type, cancel_event=cancel_event)
         )
-        attempts = 1 if expected_generation is not None else 2
+        # 快照世代路径也给第二次机会 (issue #517): 循环内撞换代时下方 except
+        # 已用 data_generation_await 刷新世代, 这里只需不再限定单次尝试。
+        attempts = 2
         for attempt in range(attempts):
             try:
                 market = load_market_data_matrix_from_parquet(
@@ -551,11 +674,21 @@ class BacktestEngine:
                         self.repo.store.data_dir if self.repo is not None else None,
                         fundamental_names,
                     )
+                if ext_wanted:
+                    from app.factors.ext_factors import attach_matrix_ext_fields
+
+                    market = attach_matrix_ext_fields(
+                        market,
+                        self.repo.store.data_dir if self.repo is not None else None,
+                        ext_wanted,
+                    )
                 return market
             except EnrichedGenerationUnavailableError:
                 if attempt + 1 >= attempts:
                     raise
-                source_generation = self.data_generation(asset_type)
+                source_generation = self.data_generation_await(
+                    asset_type, cancel_event=cancel_event
+                )
             except pa.ArrowException as exc:
                 raise ValueError(f"direct market matrix parquet scan failed: {exc}") from exc
         raise EnrichedGenerationUnavailableError(
@@ -855,7 +988,7 @@ class BacktestEngine:
             dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if dates and symbols:
-                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, "stock")
+                loaded = self._load_minute_for_fills(self.repo, list(symbols), dates, config.asset_type)
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
 
         def _count(key: str) -> None:
@@ -913,11 +1046,24 @@ class BacktestEngine:
             flags = matrix.limit_up_locked if direction == "up" else matrix.limit_down_locked
             return bool(flags[time_id, asset_id]) and same
 
+        def _intraday_entry(time_id: int, asset_id: int) -> bool:
+            """该格建仓是否发生在盘中: 分钟策略的逐格价格覆盖 (entry_price) 有限,
+            或 minute_fill 细化可用。粗粒度: 只要有分钟数据即视为盘中 — 方向保守
+            (多计入峰值 → 早退出), 不会像漏计那样高估收益。"""
+            if matrix.entry_price is not None and bool(np.isfinite(matrix.entry_price[time_id, asset_id])):
+                return True
+            return config.minute_fill and bool(minute_cache)
+
         def _can_buy(time_id: int, asset_id: int) -> tuple[bool, str]:
             if not matrix.tradable[time_id, asset_id]:
                 return False, "buy_suspended"
             if not _valid_price(entry_prices[time_id, asset_id]):
                 return False, "buy_invalid_price"
+            if config.entry_fill == "close_t" and bool(matrix.limit_up_locked[time_id, asset_id]):
+                # close_t 按信号日收盘价成交: 收盘封板(含一字)在收盘价的买队排队
+                # 现实中排不进, 一律拦截 — 旧实现只拦一字板, 尾盘封板股按涨停价
+                # "成交"导致回测收益虚高。open_t+1 按次日开盘成交, 不受此限。
+                return False, "buy_limit_up"
             if _one_price_limit(time_id, asset_id, "up"):
                 return False, "buy_limit_up"
             return True, ""
@@ -928,6 +1074,16 @@ class BacktestEngine:
             price = override if override is not None else exit_prices[time_id, asset_id]
             if not _valid_price(price):
                 return False, "sell_invalid_price"
+            if (
+                override is None
+                and config.exit_fill == "close_t"
+                and bool(matrix.limit_down_locked[time_id, asset_id])
+            ):
+                # close_t 按当日收盘价卖出: 收盘封死跌停(含一字)的卖队排队现实中
+                # 排不出去, 拦截并经 pending_exit 递延到下一可卖日 — 旧实现只拦
+                # 一字跌停, 尾盘封板股按跌停价"卖出"导致亏损被低估(涨停拒买的
+                # 镜像问题)。日内风控线(override)是盘中成交, 不受收盘封板影响。
+                return False, "sell_limit_down"
             if _one_price_limit(time_id, asset_id, "down"):
                 return False, "sell_limit_down"
             return True, ""
@@ -972,13 +1128,14 @@ class BacktestEngine:
             reason: str,
             signal_date: str,
             override: float | None = None,
+            force: bool = False,
         ) -> bool:
             signal_id = (
                 _signal_id(int(matrix.exit_signal_code[time_id, asset_id]), matrix.exit_signal_ids)
                 if reason == "signal" else None
             )
             minute_trigger = config.exit_fill == "signal_next_minute" and reason == "signal"
-            if minute_trigger and override is None:
+            if not force and minute_trigger and override is None:
                 if pos.get("pending_exit_next_open"):
                     open_price = float(matrix.open[time_id, asset_id])
                     override = open_price if _valid_price(open_price) else None
@@ -994,7 +1151,11 @@ class BacktestEngine:
                         pos["blocked_exit_days"] += 1
                         _count("sell_minute_trigger_fallback")
                         return False
-            ok, blocked = _can_sell(time_id, asset_id, override)
+            if force:
+                # 期末强制记录: 已无未来数据可等, 跳过可卖性闸门按末日价格落账
+                ok, blocked = True, ""
+            else:
+                ok, blocked = _can_sell(time_id, asset_id, override)
             if not ok:
                 if not pos.get("pending_exit_reason"):
                     pos["pending_exit_reason"] = reason
@@ -1086,7 +1247,15 @@ class BacktestEngine:
                 "entry_price": entry_price,
                 "entry_score": score,
                 "hold_days": 0,
-                "max_high": max(entry_price, float(matrix.high[time_id, asset_id])),
+                # close_t 且收盘价成交: 当日 high 发生在建仓之前, 不得进入移动止损
+                # 峰值 (峰值虚高会把风控线整体上移、退出提前 — 时间口径错误);
+                # 盘中成交 (分钟策略的 entry_price_override / minute_fill 细化)
+                # 建仓后冲高合法, 仍计入。open 成交同理。
+                "max_high": (
+                    entry_price
+                    if config.entry_fill == "close_t" and not _intraday_entry(time_id, asset_id)
+                    else max(entry_price, float(matrix.high[time_id, asset_id]))
+                ),
                 "pending_exit_reason": None,
                 "pending_exit_signal_date": None,
                 "pending_exit_signal_id": None,
@@ -1119,10 +1288,15 @@ class BacktestEngine:
                 high_price = float(matrix.high[future, asset_id])
                 if _valid_price(high_price):
                     pos["max_high"] = max(float(pos["max_high"]), high_price)
-            if not closed and not pos.get("pending_exit_reason"):
+            if not closed and future_times:
                 last_time = future_times[-1]
+                # 尾部仍被递延(封板/停牌)的持仓不再静默丢弃: 期末已无未来数据
+                # 可等, 按末日价格强制记录平仓, blocked_exit_days>0 保留"曾受阻"。
                 _try_close(
-                    pos, last_time, asset_id, "end", matrix.timestamp_labels[last_time][:10]
+                    pos, last_time, asset_id,
+                    str(pos.get("pending_exit_reason") or "end"),
+                    matrix.timestamp_labels[last_time][:10],
+                    force=True,
                 )
 
         result = self._calc_independent_candidate_result(
@@ -1238,13 +1412,24 @@ class BacktestEngine:
             if _marr is None:
                 return daily_price
             _ref = None
-            for _col in ("ma5", "ma10", "ma20"):
+            for _col, _win in (("ma5", 5), ("ma10", 10), ("ma20", 20)):
                 if _col in panel.columns:
                     try:
                         _fv = float(panel[_col][idx])
-                        if _fv > 0 and np.isfinite(_fv):
+                        if not (_fv > 0 and np.isfinite(_fv)):
+                            continue
+                        # 当日已知纪律 (#388, 与 matrix 路径同口径): enriched maN
+                        # 含当根收盘, 盘中成交不可能知道当日收盘 → 代数剔除;
+                        # close 缺失/非法时退回原均线 (该格本不可交易)。
+                        try:
+                            _cv = float(panel["close"][idx])
+                        except (TypeError, ValueError):
+                            _cv = float("nan")
+                        if _win > 1 and _cv > 0 and np.isfinite(_cv):
+                            _ref = (_win * _fv - _cv) / (_win - 1)
+                        else:
                             _ref = _fv
-                            break
+                        break
                     except (TypeError, ValueError):
                         pass
             _precise = self._resolve_minute_fill(_marr, _ref, side)
@@ -1336,6 +1521,11 @@ class BacktestEngine:
                 return False, "buy_suspended"
             if not _valid_price(entry_prices[idx]):
                 return False, "buy_invalid_price"
+            if config.entry_fill == "close_t" and bool(limit_up_flags[idx]):
+                # close_t 按信号日收盘价成交: 收盘封板(含一字)在收盘价的买队排队
+                # 现实中排不进, 一律拦截 — 旧实现只拦一字板, 尾盘封板股按涨停价
+                # "成交"导致回测收益虚高。open_t+1 按次日开盘成交, 不受此限。
+                return False, "buy_limit_up"
             if _is_one_price_limit(idx, "up"):
                 return False, "buy_limit_up"
             return True, ""
@@ -1346,6 +1536,16 @@ class BacktestEngine:
             exit_price = exit_price_override if exit_price_override is not None else exit_prices[idx]
             if not _valid_price(exit_price):
                 return False, "sell_invalid_price"
+            if (
+                exit_price_override is None
+                and config.exit_fill == "close_t"
+                and bool(limit_down_flags[idx])
+            ):
+                # close_t 按当日收盘价卖出: 收盘封死跌停(含一字)的卖队排队现实中
+                # 排不出去, 拦截并经 pending_exit 递延到下一可卖日 — 旧实现只拦
+                # 一字跌停, 尾盘封板股按跌停价"卖出"导致亏损被低估(涨停拒买的
+                # 镜像问题)。日内风控线(override)是盘中成交, 不受收盘封板影响。
+                return False, "sell_limit_down"
             if _is_one_price_limit(idx, "down"):
                 return False, "sell_limit_down"
             return True, ""
@@ -1396,8 +1596,12 @@ class BacktestEngine:
                         return "take_profit", tp_line
             return None, None
 
-        def _try_close(pos: dict, idx: int, reason: str, signal_date: str, exit_price_override: float | None = None) -> bool:
-            ok, block_reason = _can_sell(idx, exit_price_override)
+        def _try_close(pos: dict, idx: int, reason: str, signal_date: str, exit_price_override: float | None = None, force: bool = False) -> bool:
+            if force:
+                # 期末强制记录: 已无未来数据可等, 跳过可卖性闸门按末日价格落账
+                ok, block_reason = True, ""
+            else:
+                ok, block_reason = _can_sell(idx, exit_price_override)
             if not ok:
                 if not pos.get("pending_exit_reason"):
                     pos["pending_exit_reason"] = reason
@@ -1487,13 +1691,16 @@ class BacktestEngine:
                 "entry_price": entry_price,
                 "entry_score": score,
                 "hold_days": 0,
+                # close_t 收盘成交: 当日 high 在建仓前发生, 不进移动止损峰值
+                # (与矩阵独立路径同口径)
                 "max_high": entry_price,
                 "pending_exit_reason": None,
                 "pending_exit_signal_date": None,
                 "blocked_exit_days": 0,
             }
             hi = float(high_prices[entry_idx])
-            if _valid_price(hi):
+            legacy_intraday_entry = config.minute_fill and bool(minute_cache)
+            if (config.entry_fill != "close_t" or legacy_intraday_entry) and _valid_price(hi):
                 pos["max_high"] = max(float(pos["max_high"]), hi)
 
             closed = False
@@ -1533,8 +1740,15 @@ class BacktestEngine:
             if not closed:
                 if last_idx == entry_idx:
                     _count("sell_no_future")
-                elif not pos.get("pending_exit_reason"):
-                    _try_close(pos, last_idx, "end", self._date_str(panel_dates[last_idx]))
+                else:
+                    # 尾部仍被递延(封板/停牌)的持仓不再静默丢弃: 期末已无未来数据
+                    # 可等, 按末日价格强制记录平仓, blocked_exit_days>0 保留"曾受阻"。
+                    _try_close(
+                        pos, last_idx,
+                        str(pos.get("pending_exit_reason") or "end"),
+                        self._date_str(panel_dates[last_idx]),
+                        force=True,
+                    )
 
         return self._calc_independent_candidate_result(trades, n_candidates, execution_stats)
 
@@ -1591,7 +1805,9 @@ class BacktestEngine:
             total_vol = float(np.nansum(volumes))
             total_amt = float(np.nansum(amounts))
             if total_vol > 0 and total_amt > 0:
-                return total_amt / total_vol
+                # volume 单位是手 (1 手 = 100 股), amount 是元 — 与 scoring/
+                # intraday_features/matrix 的 VWAP 同口径; 缺 x100 会放大 100 倍 (#387)
+                return total_amt / (total_vol * 100.0)
 
         return float(closes[-1]) if np.isfinite(closes[-1]) else None
 
@@ -1767,12 +1983,8 @@ class BacktestEngine:
             trigger_dates = {matrix.timestamp_labels[int(t)][:10] for t in trigger_times}
             trigger_symbols = {matrix.symbols[int(a)] for a in trigger_assets}
             if trigger_dates and trigger_symbols:
-                asset_type = "etf" if all(
-                    symbol.endswith(".SH") and symbol.startswith("5")
-                    for symbol in list(trigger_symbols)[:5]
-                ) else "stock"
                 loaded = self._load_minute_for_fills(
-                    self.repo, list(trigger_symbols), trigger_dates, asset_type,
+                    self.repo, list(trigger_symbols), trigger_dates, config.asset_type,
                 )
                 minute_cache = {key: value for key, value in loaded.items() if value is not None and len(value) > 0}
 
@@ -1840,11 +2052,24 @@ class BacktestEngine:
             flag = matrix.limit_up_locked if direction == "up" else matrix.limit_down_locked
             return bool(flag[time_id, asset_id]) and same_price
 
+        def _intraday_entry(time_id: int, asset_id: int) -> bool:
+            """该格建仓是否发生在盘中: 分钟策略的逐格价格覆盖 (entry_price) 有限,
+            或 minute_fill 细化可用。粗粒度: 只要有分钟数据即视为盘中 — 方向保守
+            (多计入峰值 → 早退出), 不会像漏计那样高估收益。"""
+            if matrix.entry_price is not None and bool(np.isfinite(matrix.entry_price[time_id, asset_id])):
+                return True
+            return config.minute_fill and bool(minute_cache)
+
         def _can_buy(time_id: int, asset_id: int) -> tuple[bool, str]:
             if not matrix.tradable[time_id, asset_id]:
                 return False, "buy_suspended"
             if not _valid_price(entry_prices[time_id, asset_id]):
                 return False, "buy_invalid_price"
+            if config.entry_fill == "close_t" and bool(matrix.limit_up_locked[time_id, asset_id]):
+                # close_t 按信号日收盘价成交: 收盘封板(含一字)在收盘价的买队排队
+                # 现实中排不进, 一律拦截 — 旧实现只拦一字板, 尾盘封板股按涨停价
+                # "成交"导致回测收益虚高。open_t+1 按次日开盘成交, 不受此限。
+                return False, "buy_limit_up"
             if _one_price_limit(time_id, asset_id, "up"):
                 return False, "buy_limit_up"
             return True, ""
@@ -1855,6 +2080,16 @@ class BacktestEngine:
             price = override if override is not None else exit_prices[time_id, asset_id]
             if not _valid_price(price):
                 return False, "sell_invalid_price"
+            if (
+                override is None
+                and config.exit_fill == "close_t"
+                and bool(matrix.limit_down_locked[time_id, asset_id])
+            ):
+                # close_t 按当日收盘价卖出: 收盘封死跌停(含一字)的卖队排队现实中
+                # 排不出去, 拦截并经 pending_exit 递延到下一可卖日 — 与独立路径/
+                # legacy 路径同口径 (本路径此前只拦一字板, 尾盘封板股按跌停价
+                # "卖出"导致亏损被低估)。
+                return False, "sell_limit_down"
             if _one_price_limit(time_id, asset_id, "down"):
                 return False, "sell_limit_down"
             return True, ""
@@ -2076,7 +2311,34 @@ class BacktestEngine:
                             raw_weights = np.array([max(item[1], 0.0) for item in selected])
                             if raw_weights.sum() > 0:
                                 weights = raw_weights / raw_weights.sum()
+                        policy_scale = 1.0
+                        if config.position_sizing == "policy" and config.position_policy_compute is not None:
+                            policy_returns: dict[str, np.ndarray] = {}
+                            for asset_id, _score in selected:
+                                # 窗口截止到入场信号日 (与评分同时刻) — open_t+1 成交日
+                                # 的 K 线对决策是未来数据, 不得进入。
+                                source_time = int(matrix.entry_signal_time[time_id, int(asset_id)])
+                                if source_time < 0:
+                                    source_time = time_id
+                                col = matrix.close[max(0, source_time - 59):source_time + 1, int(asset_id)].astype(np.float64)
+                                finite = col[np.isfinite(col)]
+                                if finite.size >= 2:
+                                    sym = str(matrix.symbols[int(asset_id)])
+                                    policy_returns[sym] = np.diff(finite) / finite[:-1]
+                            weights, policy_scale = _apply_position_policy(
+                                config,
+                                [(str(matrix.symbols[int(a)]), float(s)) for a, s in selected],
+                                policy_returns,
+                                trades,
+                                cash,
+                                equity_before,
+                                peak,
+                                len(positions),
+                                execution_stats,
+                            )
                         total_budget = min(cash, exposure_capacity, target_value * len(selected))
+                        if policy_scale < 1.0:
+                            total_budget = max(total_budget * policy_scale, 0.0)
                         for (asset_id, entry_score), weight in zip(selected, weights):
                             if len(positions) >= max_positions:
                                 _count("buy_no_slot")
@@ -2128,7 +2390,16 @@ class BacktestEngine:
 
             for asset_id, pos in positions.items():
                 high_price = float(matrix.high[time_id, asset_id])
-                if _valid_price(high_price):
+                # close_t 且收盘价成交的当日建仓: 当日 high 在建仓之前, 不进移动
+                # 止损峰值; 盘中成交 (override/minute_fill) 与 open 成交仍计入。
+                if (
+                    _valid_price(high_price)
+                    and not (
+                        config.entry_fill == "close_t"
+                        and not _intraday_entry(time_id, asset_id)
+                        and pos["entry_date"] == date_text
+                    )
+                ):
                     pos["max_high"] = max(float(pos["max_high"]), high_price)
             valid_closes = np.isfinite(matrix.close[time_id]) & (matrix.close[time_id] > 0)
             last_close[valid_closes] = matrix.close[time_id, valid_closes]
@@ -2155,6 +2426,26 @@ class BacktestEngine:
                     "value": round(float(drawdown), 4),
                 })
 
+        # 期末仍持仓 (含被封板/停牌递延的): 不再只计入 pending_exit_positions 而
+        # 静默丢弃交易记录 — 按该标的最后一个价格有效日强制落账,
+        # blocked_exit_days 保留"曾受阻"痕迹 (与独立路径的期末兜底同口径,
+        # n_trades/win_rate 与权益口径不再分裂)。先取 pending 计数再清仓。
+        pending_exit_count = sum(1 for pos in positions.values() if pos.get("pending_exit_reason"))
+        for asset_id in list(positions):
+            last_time = None
+            for t in range(time_count - 1, -1, -1):
+                if _valid_price(exit_prices[t, asset_id]):
+                    last_time = t
+                    break
+            if last_time is None:
+                continue
+            _sell(
+                last_time, asset_id,
+                str(positions[asset_id].get("pending_exit_reason") or "end"),
+                matrix.timestamp_labels[last_time][:10],
+                set(),
+            )
+
         statistics_started = time.perf_counter()
         stats = self._calc_portfolio_stats_from_values(
             equity_values,
@@ -2168,7 +2459,7 @@ class BacktestEngine:
             1,
         )
         stats["execution"] = execution_stats
-        stats["pending_exit_positions"] = sum(1 for pos in positions.values() if pos.get("pending_exit_reason"))
+        stats["pending_exit_positions"] = pending_exit_count
         stats["market_matrix_shape"] = [time_count, asset_count]
         stats["market_matrix_bytes"] = matrix.nbytes
         return SimResult(
@@ -2286,6 +2577,13 @@ class BacktestEngine:
         positions: dict[str, dict] = {}
         last_close: dict[str, float] = {}
         trades: list[TradeRecord] = []
+        # 仓位策略 recent_returns 切片用: 面板按 symbol 连续排序, 记录每标的首行。
+        symbol_first_row: dict[str, int] = {}
+        if config.position_sizing == "policy" and config.position_policy_compute is not None:
+            uniq_syms, first_idx = np.unique(panel_symbols, return_index=True)
+            symbol_first_row = {
+                str(s): int(i) for s, i in zip(uniq_syms, first_idx, strict=True)
+            }
 
         # ── 分钟K精确成交预加载 ──
         # 信号触发日加载分钟K, 成交时用穿越价/VWAP替代收盘价
@@ -2317,16 +2615,23 @@ class BacktestEngine:
             marr = minute_cache.get((sym, d_str))
             if marr is None:
                 return daily_price
-            # 参考线: 从 panel 取 ma5/ma10/ma20 作为近似 (均线类信号)
+            # 参考线: 从 panel 取 ma5/ma10/ma20 作为近似 (均线类信号)。
+            # 当日已知纪律 (#388, 与 matrix 路径同口径): enriched maN 含当根收盘,
+            # 盘中成交不可能知道当日收盘 → 代数剔除; close 缺失/非法时退回原均线。
             ref = None
-            for col in ("ma5", "ma10", "ma20"):
+            for col, win in (("ma5", 5), ("ma10", 10), ("ma20", 20)):
                 if col in panel.columns:
                     val = panel[col][idx]
                     try:
                         fv = float(val)
-                        if fv > 0 and np.isfinite(fv):
-                            ref = fv
-                            break
+                        if not (fv > 0 and np.isfinite(fv)):
+                            continue
+                        try:
+                            cv = float(panel["close"][idx])
+                        except (TypeError, ValueError):
+                            cv = float("nan")
+                        ref = (win * fv - cv) / (win - 1) if (win > 1 and cv > 0 and np.isfinite(cv)) else fv
+                        break
                     except (TypeError, ValueError):
                         pass
             precise = self._resolve_minute_fill(marr, ref, side)
@@ -2400,6 +2705,11 @@ class BacktestEngine:
                 return False, "buy_suspended"
             if not _valid_price(entry_prices[idx]):
                 return False, "buy_invalid_price"
+            if config.entry_fill == "close_t" and bool(limit_up_flags[idx]):
+                # close_t 按信号日收盘价成交: 收盘封板(含一字)在收盘价的买队排队
+                # 现实中排不进, 一律拦截 — 旧实现只拦一字板, 尾盘封板股按涨停价
+                # "成交"导致回测收益虚高。open_t+1 按次日开盘成交, 不受此限。
+                return False, "buy_limit_up"
             if _is_one_price_limit(idx, "up"):
                 return False, "buy_limit_up"
             return True, ""
@@ -2410,6 +2720,16 @@ class BacktestEngine:
             exit_price = exit_price_override if exit_price_override is not None else exit_prices[idx]
             if not _valid_price(exit_price):
                 return False, "sell_invalid_price"
+            if (
+                exit_price_override is None
+                and config.exit_fill == "close_t"
+                and bool(limit_down_flags[idx])
+            ):
+                # close_t 按当日收盘价卖出: 收盘封死跌停(含一字)的卖队排队现实中
+                # 排不出去, 拦截并经 pending_exit 递延到下一可卖日 — 旧实现只拦
+                # 一字跌停, 尾盘封板股按跌停价"卖出"导致亏损被低估(涨停拒买的
+                # 镜像问题)。日内风控线(override)是盘中成交, 不受收盘封板影响。
+                return False, "sell_limit_down"
             if _is_one_price_limit(idx, "down"):
                 return False, "sell_limit_down"
             return True, ""
@@ -2625,7 +2945,32 @@ class BacktestEngine:
                 raw = np.array([max(x[2], 0.0) for x in selected], dtype=float)
                 if raw.sum() > 0:
                     weights = raw / raw.sum()
+            policy_scale = 1.0
+            if config.position_sizing == "policy" and config.position_policy_compute is not None:
+                policy_returns: dict[str, np.ndarray] = {}
+                for idx, sym, _score in selected:
+                    # 窗口截止到入场信号日 (与评分同时刻); open_t+1 时成交行 idx 的
+                    # 前一行才是信号行 — 成交日 K 线对决策是未来数据。
+                    sig_idx = int(idx) - 1 if config.entry_fill == "open_t+1" else int(idx)
+                    lo = max(symbol_first_row.get(str(sym), 0), sig_idx - 59)
+                    closes = close_prices[lo:sig_idx + 1].astype(np.float64)
+                    finite = closes[np.isfinite(closes)]
+                    if finite.size >= 2:
+                        policy_returns[str(sym)] = np.diff(finite) / finite[:-1]
+                weights, policy_scale = _apply_position_policy(
+                    config,
+                    [(str(sym), float(score)) for _idx, sym, score in selected],
+                    policy_returns,
+                    trades,
+                    cash,
+                    account_equity_before_buy,
+                    peak,
+                    len(positions),
+                    execution_stats,
+                )
             total_budget = min(cash, exposure_capacity, target_position_value * len(selected))
+            if policy_scale < 1.0:
+                total_budget = max(total_budget * policy_scale, 0.0)
 
             for (idx, sym, _score), weight in zip(selected, weights):
                 if len(positions) >= max_positions:
@@ -2705,7 +3050,17 @@ class BacktestEngine:
                 idx = row_by_symbol.get(sym)
                 if idx is not None:
                     hi = float(high_prices[idx])
-                    if _valid_price(hi):
+                    # close_t 且收盘价成交的当日建仓: 当日 high 在建仓之前, 不进
+                    # 移动止损峰值; minute_fill 细化 (盘中成交) 仍计入。
+                    legacy_intraday_entry = config.minute_fill and bool(minute_cache)
+                    if (
+                        _valid_price(hi)
+                        and not (
+                            config.entry_fill == "close_t"
+                            and not legacy_intraday_entry
+                            and pos["entry_date"] == str(d_str)[:10]
+                        )
+                    ):
                         pos["max_high"] = max(float(pos.get("max_high", pos["entry_price"])), hi)
 
             for i in idxs:
@@ -2727,9 +3082,27 @@ class BacktestEngine:
             })
             drawdown_curve.append({"date": d_str[:10], "value": round(float(dd), 4)})
 
+        # 期末仍持仓 (含递延): 与矩阵路径同口径, 按最后一个价格有效日强制落账。
+        # 先取 pending 计数再清仓。
+        pending_exit_count = sum(1 for p in positions.values() if p.get("pending_exit_reason"))
+        for sym in list(positions):
+            last_idx = None
+            for i in range(n - 1, -1, -1):
+                if str(panel_symbols[i]) == sym and _valid_price(exit_prices[i]):
+                    last_idx = i
+                    break
+            if last_idx is None:
+                continue
+            _sell(
+                sym, last_idx,
+                str(positions[sym].get("pending_exit_reason") or "end"),
+                self._date_str(panel_dates[last_idx]),
+                set(),
+            )
+
         stats = self._calc_portfolio_stats(equity_curve, trades, config.initial_capital)
         stats["execution"] = execution_stats
-        stats["pending_exit_positions"] = sum(1 for p in positions.values() if p.get("pending_exit_reason"))
+        stats["pending_exit_positions"] = pending_exit_count
         per_symbol = self._calc_per_symbol(trades)
         return SimResult(
             equity_curve=equity_curve,
@@ -2896,7 +3269,9 @@ class BacktestEngine:
             max_dd = min(max_dd, dd)
 
         # 夏普 — 用交易收益标准差近似
-        sharpe = float(np.mean(pnls) / np.std(pnls)) * np.sqrt(252) if np.std(pnls) > 0 else 0.0
+        # 样本标准差 (ddof=1): 与主流回测库惯例一致; 单样本 std=nan → 守卫为 0
+        _std = float(np.std(pnls, ddof=1)) if len(pnls) > 1 else 0.0
+        sharpe = float(np.mean(pnls) / _std) * np.sqrt(252) if _std > 0 else 0.0
 
         # Sortino: 刻意沿用本函数 sharpe 的逐笔收益 x sqrt(252) 基准。逐笔年化非严格正确,
         # 但保证同一函数内 sharpe/sortino 口径一致可比 (内部一致 > 局部绝对)。仅惩罚下行波动。
@@ -3027,7 +3402,9 @@ class BacktestEngine:
         drawdowns = values / peaks - 1 if len(values) else np.array([])
         max_drawdown = float(drawdowns.min()) if len(drawdowns) else 0.0
         daily = np.array(daily_avg, dtype=float)
-        sharpe = float(np.mean(daily) / np.std(daily) * np.sqrt(252)) if len(daily) > 1 and np.std(daily) > 0 else 0.0
+        # 样本标准差 (ddof=1), 与主流回测库惯例一致
+        _std = float(np.std(daily, ddof=1)) if len(daily) > 1 else 0.0
+        sharpe = float(np.mean(daily) / _std * np.sqrt(252)) if _std > 0 else 0.0
         sortino = BacktestEngine._sortino_ratio(daily)
 
         stats = {
@@ -3118,7 +3495,9 @@ class BacktestEngine:
         peaks = np.maximum.accumulate(values)
         drawdowns = values / peaks - 1
         max_drawdown = float(drawdowns.min()) if len(drawdowns) else 0.0
-        sharpe = float(np.mean(daily) / np.std(daily) * np.sqrt(252)) if len(daily) and np.std(daily) > 0 else 0.0
+        # 样本标准差 (ddof=1), 与主流回测库惯例一致
+        _std = float(np.std(daily, ddof=1)) if len(daily) > 1 else 0.0
+        sharpe = float(np.mean(daily) / _std * np.sqrt(252)) if _std > 0 else 0.0
         sortino = BacktestEngine._sortino_ratio(daily)
         pnls = np.array([t.pnl_pct for t in trades], dtype=float) if trades else np.array([])
         durations = np.array([t.duration for t in trades], dtype=float) if trades else np.array([])

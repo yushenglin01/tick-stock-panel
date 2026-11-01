@@ -107,7 +107,6 @@ export function Indices() {
     queryKey: QK.indexMinute(selectedSymbol, selectedDate ?? ''),
     queryFn: () => api.indexMinute(selectedSymbol, selectedDate ?? undefined),
     enabled: !!selectedSymbol && !!selectedDate && hasMinuteCap,
-    placeholderData: (prev) => prev,
   })
 
   const syncDaily = useMutation({
@@ -129,7 +128,9 @@ export function Indices() {
 
   const chartRows = useMemo(() => toOHLC(daily.data?.rows ?? []), [daily.data?.rows])
   const selectedInfo = topRows.find(r => r.symbol === selectedSymbol) || daily.data?.index_info
-  const minuteRows: MinuteKlineRow[] = minute.data?.rows ?? []
+  const minuteRows: MinuteKlineRow[] = minute.data?.symbol === selectedSymbol
+    && minute.data?.date === selectedDate && daily.data?.symbol === selectedSymbol
+    ? minute.data.rows : []
   const selectedIdx = selectedDate ? chartRows.findIndex(r => r.date === selectedDate) : -1
   const prevClose = selectedIdx > 0
     ? chartRows[selectedIdx - 1].close
@@ -176,14 +177,14 @@ export function Indices() {
         <div>
           <h1 className="text-lg font-semibold text-foreground">指数</h1>
           <p className="mt-1 text-xs text-muted">
-            指数使用独立 kline_index_* parquet，不进入股票选股和策略链路。
+            指数使用独立 kline_index_* parquet，不进入股票策略链路。
           </p>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => syncDaily.mutate()}
             disabled={syncDaily.isPending}
-            className="inline-flex items-center gap-1.5 rounded-btn bg-accent px-3 py-1.5 text-xs font-medium text-base hover:bg-accent/90 disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 rounded-btn bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent/90 disabled:opacity-50"
           >
             {syncDaily.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
             同步指数日K
@@ -250,7 +251,10 @@ export function Indices() {
                   showMarkers={false}
                   symbol={selectedSymbol}
                   linkedPrice={linkedPrice}
-                  onDateClick={setSelectedDate}
+                  onDateClick={(date) => {
+                    setSelectedDate(date)
+                    setLinkedPrice(null)
+                  }}
                   visibleBars={48}
                   activeIndicators={['vol', 'macd']}
                 />
@@ -272,6 +276,7 @@ export function Indices() {
                     )}
                     {minuteRows.length > 0 && (
                       <EChartsIntraday
+                        key={`${selectedSymbol}:${selectedDate}`}
                         data={minuteRows}
                         height={620}
                         prevClose={prevClose}

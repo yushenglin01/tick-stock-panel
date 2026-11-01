@@ -15,21 +15,30 @@
 
 当前已可用的主要扩展能力：
 
-- 自定义、AI 和叠加策略目录：`data/strategies/`。
+- 自定义、AI 和叠加策略目录：`data/strategies/`。策略与信号已全面去内置化——无内置策略目录，新装环境策略库为空（默认信号定义由种子自动种入；旧版本升级用户自动补回原内置策略、失效策略文件自动迁移归档）。策略参数类型支持 `float/int/bool/select/date/string`；每策略可配「叠加条件」（`overlay_filter`，存于策略 override）：字段+运算符+值的多行 AND 硬过滤，选股/回测/监控三处一致生效，不改策略代码。
 - 数据源 Provider 与 `plugin.yaml` 机制：详见 [`plugin-development.md`](plugin-development.md)。
 - 扩展数据与声明式分析页面：适合不需要自定义 React 交互的页面。
 - 前端源码扩展注册：`frontend/src/custom/<namespace>/extension.tsx`，支持静态页面、导航和已开放插槽。
 - 后端源码扩展注册：`backend/app/custom/<module>.py`，支持 FastAPI 路由、启动钩子和通知格式化器。
 - 当前前端插槽：`layout.navigation.extra`、`stock-preview.footer`、`watchlist.toolbar`。
 - 当前后端继承点：`NotificationFormatter`。
+- 自定义仓位策略（`PositionSizingPolicy`，已实现）：`data/user_data/position_policies/*.py`，在「设置 → 定义 → 仓位策略」创建（表单 META + 只写一个 `def compute(ctx)` 函数，模板起步）。契约见 `app/backtest/position_sizing.py`：ctx 只含当日及以前信息（候选评分/近 60 日收益/已平仓快照/组合状态/参数），输出 weights + budget_scale，引擎侧单仓上限/现金/敞口钳制不变。保存/备份导入均过「AST 安全校验 → 结构解析 → 合成冒烟」三关；回测在「买入权重 → 自定义策略」选用，引用失效 400 拒绝、运行期异常当日回退等权并计入统计。
+- 因子平台与策略线的既有桥接（已实现，二开时直接复用、勿重复实现）：因子库一键生成单因子排名策略（`GenerateFactorStrategyDialog` → `custom_factor_*`）；策略触发器引用因子条件信号（`AddFactorSignalDialog`，`csg_f_*`）；自定义信号 AI 提示词含因子分组（`custom_signals_ai.py`）；策略回测因子归因（`strategy.py` 的 `factor_attribution`，覆盖 `meta.scoring` 非空的策略）。
+- 旧策略包格式与接口（兼容保留）：按依赖闭包打包策略 `.py` + 引用的自定义信号/因子定义 + 用户调参（叠加策略含子策略）。`app/services/strategy_bundle.py` 只保留兼容入口，实际实现统一位于 `app/services/resource_bundle.py`；新旧接口共用依赖闭包、ZIP 安全校验、打包与资源预检，旧导入复用 `config_backup.apply_archive` 的校验/逐条写盘/冒烟管线，缺失依赖在旧预览中只作预警。包内仅允许策略/调参/信号/因子四类，其他路径 400 拒绝。API：`GET /api/strategies/{id}/bundle`、`POST /api/strategies/bundle/inspect|apply`；当前页面入口使用下述统一资源传输。
+- 统一资源传输（已实现）：策略、因子、信号页各使用一个 `ResourceTransferButton` 图标，在当前页打开 `ResourceTransferDialog`；`kind` 限定主资源列表类型，依赖统一展示并自动携带。多文件识别后优先选择同类型原始项，没有此类型原始项时允许从混合包提取该类型定义；确认冲突后只提交所选项及其依赖。`StrategyExportButton` 与弹窗共用 `downloadResourceBundle`，单个策略和批量导出均下载 ZIP，包含所需因子、信号与已保存调参。处理期间禁用关闭，关闭后重开重置临时状态。服务层 `app/services/resource_bundle.py` 统一收集多资源依赖闭包，复用备份路径/原子写与定义编译；新包格式 `tick-resource-bundle` v1，兼容旧策略包。预览通过 `registry.isolated_registry()` 在请求上下文副本内检查同包因子，不向实时线程泄漏定义；新导入链路预检后整批提交，写入/注册/重载失败回滚，区别于旧备份接口的逐条容错语义。API 位于 `/api/definitions/resources`，详见 [策略文档](strategy.md#资源导入与批量导出)。
+- 模拟盘「绑定即评估」（已实现，`app/strategy/paper_watch.py`）：账户绑定策略（自动跟单规则 `match_kind=strategy`）即自动进入实时评估循环——引擎内存态注入合成规则（`paper_watch:{strategy_id}`，不落盘、不进监控页），事件照常喂 `paper_auto.on_rule_events`。同步幂等且与真监控规则去重（同策略已有启用中的监控规则则不注入，避免重复事件）；`set_rules` 是全量覆盖，故监控规则任何保存后都会重注入。合成规则的信号是沙盒信号：只驱动模拟盘下单，不进 SSE 告警/系统通知/webhook/留痕（`quote_service` 按 `is_paper_watch_event` 分流）。
 
 尚未实现、只能在真实需求出现后增加的能力：
 
 - 更多页面局部插槽。
-- 候选过滤、评分、仓位、风控和回测成本等后端业务策略接口。
+- 候选过滤、评分、风控和回测成本等后端业务策略接口（仓位 `PositionSizingPolicy` 已实现，见上）。
 - 配置 schema 迁移注册表。
 
 AI 在开始任务前必须通过代码搜索确认能力是否已经实现。找不到定义和测试时，应把示例视为设计规范，不得虚构导入路径或调用结果。
+
+## 外部数据源包安装（已实现）
+
+外置 Provider 源码包、版本状态与加载生命周期由原数据源加载器统一管理；上传/安装/版本管理 API 由 `app/custom/source_packages` 扩展注册。前端新增 `settings.data-sources.toolbar` 和 `settings.data-sources.detail-actions` 插槽，复用现有卡片、Key 和能力路由。完整契约及边界见 [外部数据源插件安装](external-data-source-packages.md)。
 
 ## 2. 二次开发分级
 
@@ -379,6 +388,19 @@ python3 scripts/upgrade_check.py <目标Tag或分支>
 ```
 
 脚本不会执行 merge、修改索引或工作区。它会报告共同基线、双方修改的同一文件以及 Git 三方预演可识别的文本冲突。未提交内容不会进入预演，因此正式评估前应先提交到临时二开分支。
+
+### 8.1 安装包升级保护（非 Git 用户）
+
+桌面安装包与 Docker 镜像的发布携带全量程序文件清单（`app/upgrade_manifest.json`，构建时生成）。后端每次启动会扫描程序目录并与清单对比，把用户「修改/新增」的程序文件常备备份到 `data/upgrade_guard/live/`——`data/` 不随升级覆盖，因此升级不会丢失这些文件。
+
+检测到版本变化（上次运行版本 ≠ 当前版本）时生成升级对比报告，在「设置 → 系统设置 → 升级保护」展示：
+
+- **可恢复**：用户改过、新版没动 → 升级时被覆盖，可一键恢复；
+- **需手工合并**：用户与新版都改过 → 用户版本归档在 `data/upgrade_guard/reports/<报告>/files/`，磁盘上是新版文件，对照手动合并；
+- **已一致**：新版内容与用户修改后的内容相同；
+- **新增文件可恢复**：用户新建的文件新版没有（如更换 Docker 镜像）。
+
+守卫不自动合并代码（自动改写程序文件风险不可控）。修改程序文件后重启或点「重新扫描」即可刷新常备备份；源码运行（无清单）时功能自动停用，Git 工作流仍以 `upgrade_check.py` 预检为准。
 
 ## 9. 完成检查表
 

@@ -1,6 +1,6 @@
 # 数据源插件开发指南
 
-数据源插件是可选的行情数据来源(fuyao、stock-sdk、akshare 等),作为独立模块放在
+数据源插件是可选的行情数据来源(fuyao、akshare 等),作为独立模块放在
 `backend/app/plugins/` 下。services 层(kline_sync / quote_service / financial_sync)
 全部通过统一路由点分流:插件声明了某数据集就走插件,未声明自动回退 TickFlow。
 因此**一个合格的插件只需要正确实现契约,不需要改动任何 service / API 代码**;
@@ -8,6 +8,10 @@
 
 > 无代码接入(纯 HTTP YAML 配置)请看 [custom-data-source.md](./custom-data-source.md),
 > 两种方式遵循同一套内部数据契约。
+
+## 外部安装
+
+现在可通过「设置 → 数据源 → 安装插件」上传独立源码 ZIP。外部包格式、版本管理、兼容范围和模板见 [外部数据源插件安装](external-data-source-packages.md)。现有内置目录方式继续兼容。
 
 ## 快速上手
 
@@ -28,12 +32,17 @@ display_name: "我的数据源"                 # 设置页显示名
 runtime: none                            # 运行时类型: node | python | none
 entry: app.plugins.my_source.provider:MyProvider   # provider 类的导入路径
 check: app.plugins.my_source.bridge:availability   # 可用性检测函数(可选)
-datasets: [realtime]                     # 支持的数据集: daily/adj_factor/minute/realtime/financial
+datasets: [realtime]                     # 支持: daily/adj_factor/minute/realtime/depth5/financial
 api_key_env: MY_SOURCE_API_KEY           # (可选)声明后设置页提供 Key 输入框
 hidden: false                            # (可选)true = 已加载但对设置页隐藏,不注册不展示
 description: "数据源描述"
 install_hint: "pip install xxx"          # 未装依赖时显示的安装提示
 homepage: "https://example.com"          # (可选)官网/申请地址, 显示在设置页 Key 配置说明中
+billing: points                          # (可选)计费标识: "points" → 设置页能力芯片/适配行标注「积分」
+billing_note: "消耗与频率/范围相关,间隔越短越高"  # (可选)计费提示: 设置页按警示框展示
+usage_notes:                             # (可选)使用要点: 各能力规模/节奏, 详情卡以列表展示
+  - "实时快照: 600 只/批, 全市场一轮约 10 批"
+key_manage_url: "https://example.com/me" # (可选)Key/账务管理页, 显示在设置页 Key 配置区(如积分明细入口)
 ```
 
 只声明真实提供的数据集;未声明的数据集 `provider_has_dataset` 返回 False,自动回退
@@ -57,14 +66,9 @@ TickFlow 的「先探后存」语义:
 | runtime | 含义 | 典型场景 |
 |---|---|---|
 | `python` | 纯 Python 依赖, `pip install` | akshare、tushare |
-| `node` | 需要 Node.js 运行时, `npm install` | stock-sdk |
 | `none` | 无额外依赖 | 纯 HTTP API 源 |
 
-> ⚠️ stock-sdk 在 Docker 中默认不打包(合规考虑:它抓取第三方财经网站接口,存在版权与
-> 反爬风险)。如需启用,构建时传 `--build-arg INCLUDE_STOCKSDK=1`,使用风险自负。
-> 详见 [deployment.md](./deployment.md)。
-
-`runtime` 字段当前仅用于 UI 展示, 实际依赖检测由 `check` 函数负责。
+内置插件的 `runtime` 决定依赖安装方式，实际就绪检测由 `check` 函数负责。外部源码包只检查依赖兼容性，不执行 pip/npm 安装。
 
 ### check 函数
 
@@ -99,7 +103,7 @@ def availability() -> tuple[bool, str]:
 | --- | --- | --- |
 | `change_pct` | **小数制**, `0.0366` = 3.66% | 接口给百分数(3.66)时必须在 provider 内显式 /100 |
 | `turnover_rate`(realtime 入口) | **小数制**, `0.05` = 5% | 下游 enriched 管道统一转百分数值存储 |
-| `volume` | 股 | |
+| `volume` | **手**, `436231` = 43,623,100 股 | 日K 与实时快照均以手计(1手=100股), 股票/ETF/指数一致(与上游 TickFlow 口径一致, 可用 amount÷volume÷100≈当日均价自验); 接口给股时必须在 provider 内显式 /100(参考 fuyao) |
 | `amount` / `turnover` | 元 | |
 | 日K OHLC | **不复权原始价** | 复权由 adj_factor + enriched 管道处理, provider 不得自行复权 |
 
@@ -141,13 +145,19 @@ class MyProvider:
                   on_chunk_done=None) -> pl.DataFrame:
         """日K: [symbol, date, open, high, low, close, volume, amount]; 不复权"""
 
+    def iter_daily(self, symbols, start_time, end_time, asset_type="stock",
+                   on_chunk_done=None) -> Iterator[pl.DataFrame]:
+        """(可选)有界分批返回与 get_daily 同形的日K; 全市场历史同步优先消费。"""
+
     def get_adj_factors(self, symbols, start_time, end_time, asset_type="stock",
                         on_chunk_done=None) -> pl.DataFrame:
-        """除权因子: [symbol, trade_date, ex_factor]"""
+        """除权因子: [symbol, trade_date, ex_factor]
+        (+可选明细列 dividend/bonus/allot/allot_price/prev_close, 均可空 —
+        提供时用于等差显示投影与全精度因子链重建)"""
 
     def get_minute(self, symbols, start_time, end_time, asset_type="stock",
                    on_chunk_done=None, freq="1m") -> pl.DataFrame:
-        """分钟K: [symbol, datetime(北京墙钟), open, high, low, close, volume, amount]"""
+        """分钟K: [symbol, datetime(北京墙钟), open, high, low, close, volume, amount(元, 可空)]"""
 
     def get_intraday_batch(self, symbols, count=300, asset_type="stock") -> pl.DataFrame:
         """(声明 full_minute 数据集时实现) 全量分钟修复轮: 给定标的当日 1 分钟K,
@@ -166,6 +176,9 @@ class MyProvider:
         强烈建议实现本方法, 否则指数行情冻结在本地日K兜底。失败返回 None,
         成功但无数据返回 []。"""
 
+    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
+        """(声明 depth5 时实现)五档盘口, 返回以 symbol 为键的标准盘口字典。"""
+
     def get_financials(self, table, symbols, latest_only=False) -> pl.DataFrame:
         """财务数据(声明 financial 数据集时实现, table 见 financial_sync 调用)。"""
 
@@ -178,6 +191,22 @@ class MyProvider:
         返回 error 字段说明会回退 TickFlow。"""
 ```
 
+`get_depth_batch` 返回结构如下。价格和数量数组均按一档到五档排列;数量单位为“手”,
+`timestamp` 为毫秒 Unix 时间戳。服务层按 capability 的 `batch` / `rpm` 统一分片限速,
+provider 不应自行切换或回退到其他数据源。
+
+```python
+{
+    "600519.SH": {
+        "bid_prices": [1500.0, 1499.9, 1499.8, 1499.7, 1499.6],
+        "bid_volumes": [10, 20, 30, 40, 50],
+        "ask_prices": [1500.1, 1500.2, 1500.3, 1500.4, 1500.5],
+        "ask_volumes": [12, 22, 32, 42, 52],
+        "timestamp": 1788505200000,
+    },
+}
+```
+
 ### get_minute 的 datetime 时区契约
 
 `datetime` 必须是**北京时间墙钟**（naive，如 `2026-08-28 09:35:00`），与日K的
@@ -185,12 +214,15 @@ class MyProvider:
 （09:30–11:30 / 13:00–15:00）映射每根K线，UTC 口径的帧会导致全部点位落在时轴外、
 分时图空白。
 
+`amount` 单位为元；数据源无法提供可靠的分钟成交额时应返回 `null`，不得伪造。
+成交额缺失后无法继续计算累计成交均价，前端会停止绘制后续均价线并显示 `—`。
+
 入口守卫（`kline_sync._enforce_minute_beijing_wallclock`）对所有分钟源强制归一：
 带时区 → 自动换算成北京墙钟；naive 但整体呈 UTC 特征（如 01:30）→ 自动 +8 纠偏并
 记日志；完全无法识别的口径 → 拒收并回退 TickFlow。契约仍要求源头写对，守卫只是兜底。
 
 可选类属性 `minute_history_days = 5` 声明 1 分钟历史深度（交易日）；未声明视为
-深历史（TickFlow 基准）。浅源（如 stock-sdk 免费分时仅保留最近 5 个交易日）声明后，
+深历史（TickFlow 基准）。浅源（如免费分时仅保留最近 5 个交易日的源）声明后，
 个股分时档位自动收窄为可行选项并默认 5 日，深源默认 20 日。
 
 > **全量分钟 (full_minute) 数据集契约**:声明 `full_minute` 数据集并把
@@ -206,6 +238,10 @@ class MyProvider:
 > - `get_intraday_latest(symbols=None, count=3) -> pl.DataFrame` — **可选**,
 >   稳态增量轮专用:尽量单请求返回全市场每只标的最新 `count` 根。未实现时
 >   服务自动降级为仅修复轮,节奏下限抬到 60s(全天批量打不住 6s 节奏)。
+> - **价格基准契约**:两个方法都必须返回**原始价(不复权)**。本地分钟库以 raw
+>   基准落盘 (`.raw_basis` 标记),读取侧统一做前复权投影;返回已复权价格会与
+>   本地存储混基准,产生静默的错误价格。服务状态面板的 `minute_basis_raw`
+>   字段会暴露本地库的基准迁移状态。
 >
 > 两个方法的返回帧都过 `_enforce_minute_beijing_wallclock` 时区守卫(与
 > `get_minute` 同纪律);失败抛异常或返回空 df 均按空轮处理,连续空轮触发
@@ -219,8 +255,15 @@ class MyProvider:
 | --- | --- |
 | `get_realtime` | **软失败**: 返回 `[]` + warning 日志, 保证轮询线程不中断 |
 | `get_realtime_indices` | **软失败**: 返回 `None` + warning 日志, 保留上轮有效缓存; 成功无数据返回 `[]` |
+| `get_depth_batch` | 单批异常由服务隔离并保留其他批次; 不跨数据源回退 |
 | `get_minute` | 抛异常时调用方自动回退 TickFlow 重试 |
 | `get_daily` / `get_adj_factors` / `get_financials` | 异常由上层同步流程捕获记录; 无数据返回空 DataFrame |
+| `iter_daily` | 可选; 每批必须符合 `get_daily` 契约。流正常结束后才提交 staging; 未捕获异常会丢弃 staging。provider 内已定义的单标的软失败语义保持不变 |
+
+`iter_daily` 用于避免大范围日K同步在 provider 内累积完整 DataFrame。实现该方法后,
+`kline_sync` 会优先消费它; 未实现的 provider 继续调用 `get_daily`,保持兼容。批次大小应有
+明确上界,不得先把全部结果放入列表再 `concat`。`on_chunk_done(cur, total)` 必须覆盖空批次,
+确保最终 `cur == total`。
 
 ### get_realtime 行字段
 
@@ -230,7 +273,7 @@ class MyProvider:
 | `last_price` | ✅ | 最新价 |
 | `prev_close` | ✅ | 昨收, 涨跌幅推导基准 |
 | `open` / `high` / `low` | ✅ | 当日 OHLC |
-| `volume` | ✅ | 股 |
+| `volume` | ✅ | **手**(1手=100股) |
 | `amount` | 建议 | 成交额(元) |
 | `change_pct` | 建议 | **小数制**; 缺失时下游按 change_amount/prev_close 推导 |
 | `change_amount` | 建议 | 涨跌额(元) |
@@ -283,10 +326,13 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `client.py` — httpx 客户端(X-api-key 认证 + 统一信封解包 + 分页 + 页间隔限频 + 单标的日K + dump 预签名下载, S3 下载不带 Key 头)
   - `provider.py` — Provider 实现(实测/文档双字段名映射、百分数→小数制、volume 股→手、上海零点戳 +8h 时区、dump 按 release 版本缓存、软失败、Key 探测)
   - `tests/test_fuyao_provider.py` — 73 个契约测试, 是新插件的测试范本
-- **`backend/app/plugins/stocksdk/`** — Node 型插件, 通过 subprocess 桥接调用 stock-sdk
-  - `bridge.py` — Python↔Node 桥接 + availability 检测
-  - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)
-  - `provider.py` — Provider 实现(归一化、分批、错误降级)
+- **`backend/app/plugins/tdxquant/`** — 通达信量化数据服务(runtime: python; `tdxaidata` 已是后端默认依赖, ctypes 包装的私有 TCP 协议, wheel 自带跨平台原生库)
+  - 提供 `realtime`(五市场全 A 股票池枚举 + 600 只/批快照, 批间失败隔离)、`depth5`(快照自带买卖五档数组, 手口径透传)、`daily`(count 模式单标的拉取, 原始价, volume 股→手, amount 万元→元, `iter_daily` 逐标的流式)、`adj_factor`(事件接口每10股口径 ÷10 转每股 + 本地K线一次配价, 交易所公式推导单事件比值, 涨跌停自检)、`minute`(1m count 模式单标的, 240 根/日, 深度约 40 交易日, datetime=Date+Time 拼北京墙钟 naive, 与日K同口径 股→手/万元→元)、`full_minute`(修复轮 `get_intraday_batch` 当日窗口 + 稳态增量 `get_intraday_latest` 每股最新 N 根; 无批量端点, 全市场一轮 10 分钟量级); 指数快照直接支持(上证指数走 TDX 999999.SH 别名, `get_realtime_indices` 映射); 快照无名称列由维表关联; 未声明 financial → 回退 TickFlow; 清单声明 `billing: points` + `key_manage_url`(商城积分明细入口)
+  - `client.py` — 原生层封装(lib 私有物化 + token 注入双 ini + `TDX_AI_DATA_LIB` 指向、空闲首连 "Invalid server response" 重试包装、股票池 12h 缓存)
+  - `provider.py` — Provider 实现(快照昨收=LastClose/高低=Max/Min 字段映射、涨跌幅 (Now-LastClose)/LastClose 小数制、RefreshTime 北京墙钟→epoch ms、软失败)
+  - `probe.py` — 候选 Key 探测的独立子进程(原生 DLL 每进程单 Key): 分阶段进度留痕定位原生层死点; 服务端明确拒绝凭据或额度时不保存。因 TDX 会话按 IP 复用(错误 Key 在活跃会话下也能拉数), 通过探测仅代表格式与连通性检查通过, 不保证所有数据接口均有权限。
+
+TdxQuant 在 SDK 清理响应前检查服务端错误, 保留错误原因并脱敏; 明确的凭据/额度拒绝不重试, 实时分钟轮立即熔断。历史分钟请求失败会通过 `app.data_providers.base.ProviderRequestError` 传递到任务层并标记失败, 不转换成成功的 0 行或跨源重试; 其他插件也可用该异常显式声明请求失败。带时区的分钟请求窗口在插件边界归一为北京墙钟, 再与原生分钟列比较。正常停牌、休市或窗口内无数据的空结果保留原语义。
 
 ## 路由机制(无需关心, 仅参考)
 
